@@ -106,7 +106,7 @@ warn_path() {
 
 write_path_entry() {
     local dir="$1" rcfile="$PATH_FIX_FILE"
-    if [[ -f "$rcfile" ]] && grep -qF -- "$dir" "$rcfile"; then
+    if [[ -f "$rcfile" ]] && grep -qF -- "\"$dir:" "$rcfile"; then
         printf 'PATH entry for %s already present in %s\n' "$dir" "$rcfile" >&2
     else
         {
@@ -168,7 +168,8 @@ handle_path() {
     fi
 }
 
-# Directory containing this script (the repo root), with symlinks resolved.
+# Directory containing this script (the repo root). Resolves one symlink hop
+# (a prior install of this script), then canonicalises via pwd -P.
 script_dir() {
     local src="$0" tgt dir
     if [[ "$src" != */* ]]; then

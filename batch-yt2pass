@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+Written by Emmy Killett
+"""
+from __future__ import annotations
+
+import os
+import sys
+import argparse
+import logging
+import re
+import subprocess
+from pathlib import Path
+import datetime as dt
+from typing import TextIO
+import threading
+
+IS_POSIX: bool = (os.name == "posix")
+if IS_POSIX:
+    import pty
+    import termios
+else:
+    pty     = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
+
+__version__: str = "0.2.2"
+
+# Save original TTY settings so we can restore them on exit
+_BATCH_TTY_FD:          int | None = None
+_BATCH_TTY_ATTRS: list[int] | None = None
+
+if IS_POSIX and sys.stdin.isatty():
+    try:
+        _batch_fd        = sys.stdin.fileno()
+        _BATCH_TTY_FD    = _batch_fd
+        _BATCH_TTY_ATTRS = termios.tcgetattr(_batch_fd)  # type: ignore[arg-type]
+    except Exception:
+        _BATCH_TTY_FD    = None
+        _BATCH_TTY_ATTRS = None
+
+# Regex to find URLs and common trailing punctuation that clings to them in prose.
+URL_REGEX: re.Pattern = re.compile(r'https?://[^\s<>()"]+')
+TRAILING_PUNCT:   str = '.,;:!?)\\]]}\'"'
+
+
+class Options():
+    """Class that has all global options in one place."""
+
+    def __init__(self) -> None:
+        """Initialize the Options class with default values."""
+        self.my_name:                    str = Path(sys.argv[0]).stem  # The invoked name of this script without the extension
+        self.default_log_dir:           Path = Path.cwd().expanduser().resolve()
+        self.log_mode:                   int = logging.INFO  # Use --debug to change to logging.DEBUG.
+        self.args: argparse.Namespace | None = None
+
+
+def parse_arguments(options: Options) -> None:
+    """
+    Parse command-line arguments.
+
+    Args:
+        options: Options object to store parsed arguments. Contains:
+            - my_name:      Name of the program.
+            - default_log_dir: Default directory for logs (unused by CLI, but helpful for help text).
+            - log_mode:     Logging mode (default is logging.INFO).
+            - args:         Parsed arguments will be stored here.
+
+    Returns:
+        None, but updates options.args with parsed arguments.
+
+    Raises:
+        SystemExit: If the "-v"/"--version" flag is provided,
+                    the program will print the relevant information and exit.
+        ValueError: If any of the arguments are invalid.
+    """
+    parser = argparse.ArgumentParser(description=f"Batch-run yt2pass over URLs extracted from a text file. {options.my_name} version {__version__}")
+    parser.add_argument("-v", "--version",
+                        action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("file", type=Path,
+                        help="Input text file to scan for http/https URLs.")
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="Enable debug logging.")
+    options.args = parser.parse_args()
+    assert options.args is not None  # For mypy
+    if options.args.debug:
+        options.log_mode = logging.DEBUG
+
+
+def _script_dir() -> Path:
+    """
+    Return the directory the current script file lives in, resolving symlinks.
+
+    Args:
+        None
+
+    Returns:
+        Path to the directory containing this script.
+    """
+    return Path(__file__).expanduser().resolve().parent
+
+
+def resolve_yt2pass_path() -> Path:
+    """
+    Resolve the yt2pass executable to an absolute path.
+
+    Preference order:
+        1) A file named 'yt2pass' in the same directory as this script.
+        2) The first 'yt2pass' found on PATH.
+
+    Args:
+        None
+
+    Returns:
+        Absolute Path to yt2pass.
+
+    Raises:
+        FileNotFoundError: If not found in either location.
+        PermissionError:   If found but not executable.
+    """
+    # 1) Sibling of this script
+    sibling = (_script_dir() / "yt2pass")
+    if sibling.is_file():
+        if not os.access(sibling, os.X_OK):
+            raise PermissionError(f"yt2pass is not executable: {sibling}")
+        return sibling.resolve()
+
+    # 2) Search PATH
+    for entry in os.get_exec_path():
+        cand = (Path(entry).expanduser() / "yt2pass")
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand.resolve()
+
+    raise FileNotFoundError("yt2pass not found next to the script or on PATH")
+
+
+def extract_urls_from_text(text: str) -> list[str]:
+    """
+    Extract and clean http/https URLs from a block of text.
+
+    Args:
+        text: Input text to scan.
+
+    Returns:
+        A de-duplicated list of cleaned URLs in first-seen order.
+
+    Raises:
+        None
+    """
+    raw:     list[str] = URL_REGEX.findall(text)
+    cleaned: list[str] = []
+    seen:     set[str] = set()
+
+    for u in raw:
+        v = u
+        while v and v[-1] in TRAILING_PUNCT:
+            v = v[:-1]
+        if not v:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        cleaned.append(v)
+    return cleaned
+
+
+def extract_urls_from_file(path: str | os.PathLike[str]) -> list[str]:
+    """
+    Read a file and extract/clean URLs found within.
+
+    Args:
+        path: Path to the input text file.
+
+    Returns:
+        Ordered list of cleaned, unique URLs present in the file.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        OSError:           If the file cannot be read.
+    """
+    p = Path(path)
+    text = p.read_text(encoding="utf-8", errors="replace")
+    return extract_urls_from_text(text)
+
+
+def sanity_check_yt2pass(exec_path: Path) -> tuple[bool, int, str, str]:
+    """
+    Verify that yt2pass can be launched (non-zero RC is acceptable).
+
+    Args:
+        exec_path: Absolute path to yt2pass.
+
+    Returns:
+        Tuple of (ok, return_code, stdout, stderr), where:
+            ok:          True if yt2pass executed; otherwise False.
+            return_code: Subprocess return code (or 127 if not found).
+            stdout:      Captured standard output from yt2pass invocation.
+            stderr:      Captured standard error from yt2pass invocation.
+    """
+    try:
+        cp = subprocess.run([os.fspath(exec_path)],
+                            check=False, capture_output=True, text=True)
+        return (True, cp.returncode, cp.stdout, cp.stderr)
+    except FileNotFoundError:
+        return (False, 127, "", "yt2pass not found")
+    except PermissionError as e:
+        return (False, 126, "", f"Permission denied: {e}")
+    except OSError as e:
+        return (False, 126, "", f"OS error launching yt2pass: {e}")
+
+
+def refresh_pending(infile: str | os.PathLike[str],
+                    pending: list[str],
+                    processed: set[str]) -> list[str]:
+    """
+    Re-read the infile and synchronize the pending list with current file contents.
+
+    - If a URL is newly added to the file, add it to pending (if not processed and not already pending).
+    - If a URL has been removed from the file, remove it from pending (unless already processed).
+
+    Args:
+        infile:    Path to the input file to re-scan each iteration.
+        pending:   Current list of URLs that remain to be processed (ordered).
+        processed: Set of URLs that have already been processed (success or failure).
+
+    Returns:
+        New pending list respecting the same order as before for existing entries,
+        appending newly added URLs in file order.
+
+    Raises:
+        OSError: If reading the file fails.
+    """
+    p:                 Path = Path(infile)
+    current_urls: list[str] = extract_urls_from_file(p)
+    current_set:   set[str] = set(current_urls)
+    pending_set:   set[str] = set(pending)
+
+    # Remove URLs that no longer exist in the file (but only if not processed).
+    kept_pending = [u for u in pending if (u in current_set) or (u in processed)]
+
+    # Log any removed URLs.
+    removed = [u for u in pending if (u not in current_set) and (u not in processed)]
+    if len(removed) > 0:
+        logging.info(f"Found {len(removed)} URL(s) removed from the input file; removing from pending list.")
+
+    # Add any new URLs from the file that are neither processed nor already pending.
+    to_add = [u for u in current_urls if (u not in processed) and (u not in pending_set)]
+
+    # Log any added URLs.
+    if len(to_add) > 0:
+        logging.info(f"Found {len(to_add)} new URL(s) added to the input file; adding to pending list.")
+
+    return kept_pending + to_add
+
+
+def run_yt2pass_once(exec_path: Path, url: str) -> tuple[int, str, str]:
+    """
+    Run `yt2pass` on a single URL with stdout attached to a PTY so tools like
+    yt-dlp keep their in-place (\r) progress. Stdout is mirrored live to the
+    terminal and captured for failure logs. Stderr is piped, streamed, and captured.
+
+    Args:
+        exec_path: Absolute path to yt2pass.
+        url:       URL to process.
+
+    Returns:
+        (return_code, captured_stdout, captured_stderr)
+    """
+    # Non-POSIX fallback: no PTY support, just use normal pipes.
+    if not IS_POSIX:
+        try:
+            proc = subprocess.Popen([os.fspath(exec_path), url],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            return (127, "", "yt2pass not found")
+        except PermissionError as e:
+            return (126, "", f"Permission denied: {e}")
+        except OSError as e:
+            return (126, "", f"OS error launching yt2pass: {e}")
+
+        out, err = proc.communicate()
+        return (proc.returncode, out or "", err or "")
+
+    # POSIX path: existing PTY-based implementation
+    def _pump_pty(primary_fd: int, sink, acc: list[str]) -> None:
+        try:
+            while True:
+                try:
+                    data = os.read(primary_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                acc.append(data.decode("utf-8", "replace"))
+                sink.buffer.write(data)   # preserve \r behavior
+                sink.flush()
+        finally:
+            try:
+                os.close(primary_fd)
+            except OSError:
+                pass
+
+    def _pump_stderr(stream, sink, acc: list[str]) -> None:
+        for line in stream:
+            acc.append(line)
+            sink.write(line)
+            sink.flush()
+
+    try:
+        primary_fd, secondary_fd = pty.openpty()
+        proc = subprocess.Popen([os.fspath(exec_path), url],
+                                stdout=secondary_fd,          # PTY → tool thinks it's a TTY
+                                stderr=subprocess.PIPE,       # pipe stderr (text)
+                                text=True)                    # only affects stderr
+        os.close(secondary_fd)                                # parent must close its copy
+    except FileNotFoundError:
+        return (127, "", "yt2pass not found")
+    except PermissionError as e:
+        return (126, "", f"Permission denied: {e}")
+    except OSError as e:
+        return (126, "", f"OS error launching yt2pass: {e}")
+
+    assert proc.stderr is not None
+
+    out_acc: list[str] = []
+    err_acc: list[str] = []
+
+    t_out = threading.Thread(target=_pump_pty,   args=(primary_fd, sys.stdout, out_acc), daemon=True)
+    t_err = threading.Thread(target=_pump_stderr, args=(proc.stderr, sys.stderr, err_acc), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    rc = proc.wait()
+    t_out.join()
+    t_err.join()
+
+    return (rc, "".join(out_acc), "".join(err_acc))
+
+
+def write_failure_record(file: TextIO, url: str, rc: int, out: str, err: str) -> None:
+    """
+    Append a detailed failure record (including stdout/stderr) to the failures file.
+
+    Args:
+        file: Open text file object to append to.
+        url:  URL that failed.
+        rc:   Process return code.
+        out:  Captured stdout from yt2pass.
+        err:  Captured stderr from yt2pass.
+
+    Returns:
+        None
+
+    Raises:
+        OSError: If writing fails.
+    """
+    file.write(url + f"\t(rc={rc})\n")
+    file.write("--- stdout ---\n")
+    file.write(out if out else "")
+    if out and not out.endswith("\n"):
+        file.write("\n")
+    file.write("--- stderr ---\n")
+    file.write(err if err else "")
+    if err and not err.endswith("\n"):
+        file.write("\n")
+    file.write("\n")
+    file.flush()
+
+
+def main() -> None:
+    """
+    Main function.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        SystemExit: On argument errors or early termination conditions.
+    """
+    options = Options()
+    parse_arguments(options)
+    logging.basicConfig(level=options.log_mode,
+                        format="%(asctime)s - %(levelname)s - %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
+
+    assert options.args is not None
+    infile: Path = options.args.file
+
+    if not infile.is_file():
+        print(f"Input file not found: {os.fspath(infile)}", file=sys.stderr)
+        raise SystemExit(2)
+
+    # Resolve yt2pass next to this script (or on PATH as fallback)
+    try:
+        exec_path = resolve_yt2pass_path()
+    except (FileNotFoundError, PermissionError) as e:
+        print(str(e), file=sys.stderr)
+        raise SystemExit(127)
+
+    # Sanity-check: it only needs to LAUNCH; non-zero rc is okay.
+    started, probe_rc, probe_out, probe_err = sanity_check_yt2pass(exec_path)
+    if not started:
+        print("yt2pass could not be launched; exiting.", file=sys.stderr)
+        print(f"(rc={probe_rc})", file=sys.stderr)
+        if probe_out:
+            print("--- stdout ---", file=sys.stderr)
+            print(probe_out, file=sys.stderr, end="" if probe_out.endswith("\n") else "\n")
+        if probe_err:
+            print("--- stderr ---", file=sys.stderr)
+            print(probe_err, file=sys.stderr, end="" if probe_err.endswith("\n") else "\n")
+        raise SystemExit(127)
+
+    # Initial URL extraction.
+    urls_initial = extract_urls_from_file(infile)
+    if not urls_initial:
+        print("No http/https URLs found.")
+        return
+
+    # Prepare logs.
+    stamp:       str  = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base:        str  = infile.name
+    success_log: Path = Path(f"{stamp}-yt2pass-successes-{base}")
+    failure_log: Path = Path(f"{stamp}-yt2pass-failures-{base}")
+
+    print(f"Found {len(urls_initial)} URL(s).")
+    print(f"Successes  -> {os.fspath(success_log)}")
+    print(f"Failures   -> {os.fspath(failure_log)}")
+    print()
+
+    processed_success: set[str] = set()
+    processed_failure: set[str] = set()
+    processed_all:     set[str] = set()
+    pending:          list[str] = urls_initial.copy()
+    ok_count:               int = 0
+    bad_count:              int = 0
+
+    with success_log.open("a", encoding="utf-8") as sfile, failure_log.open("a", encoding="utf-8") as ffile:
+        # Process until no pending URLs remain; refresh from file each iteration.
+        while True:
+            # Refresh the pending list from the current file contents.
+            try:
+                pending = refresh_pending(infile, pending, processed_all)
+            except OSError as e:
+                print(f"Warning: could not re-read input file ({e}). Continuing with current pending list.", file=sys.stderr)
+
+            # Remove any already-processed URLs that might be lingering.
+            pending = [u for u in pending if u not in processed_all]
+
+            remaining: int = len(pending)
+            if remaining == 0:
+                break
+
+            # Pop the next URL to process (FIFO).
+            url = pending.pop(0)
+
+            # 3a) Run yt2pass and capture stdout/stderr.
+            rc, out, err = run_yt2pass_once(exec_path, url)
+
+            if rc == 0:
+                sfile.write(url + "\n")
+                sfile.flush()
+                processed_success.add(url)
+                processed_all.add(url)
+                ok_count += 1
+            else:
+                write_failure_record(ffile, url, rc, out, err)
+                processed_failure.add(url)
+                processed_all.add(url)
+                bad_count += 1
+
+            # After processing one URL, recompute remaining (in case the refresh added more).
+            try:
+                pending = refresh_pending(infile, pending, processed_all)
+            except OSError as e:
+                print(f"Warning: could not re-read input file ({e}). Continuing with current pending list.", file=sys.stderr)
+            pending = [u for u in pending if u not in processed_all]
+            remaining = len(pending)
+
+            # 3b) Per-iteration progress line with counts.
+            print(f"Successes: {ok_count}, Failures: {bad_count}, Remaining: {remaining}")
+
+    # Write a retry file containing only the failed URLs (one per line).
+    if bad_count > 0:
+        retry_log: Path = Path(f"{stamp}-yt2pass-retry-{base}")
+        retry_log.write_text(
+            "\n".join(sorted(processed_failure)) + "\n",
+            encoding="utf-8",
+        )
+
+    print()
+    print(f"Done. Successes: {ok_count}, Failures: {bad_count}")
+    log_lines = [f"  {os.fspath(success_log)}", f"  {os.fspath(failure_log)}"]
+    if bad_count > 0:
+        log_lines.append(f"  {os.fspath(retry_log)}  (pass this to {options.my_name} to retry failures)")
+    print("Logs written to:")
+    print("\n".join(log_lines))
+    # Exit 0 only if there were no failures.
+    raise SystemExit(0 if bad_count == 0 else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        # Safety net: restore the original TTY mode if we captured it.
+        if IS_POSIX and _BATCH_TTY_FD is not None and _BATCH_TTY_ATTRS is not None:
+            try:
+                termios.tcsetattr(_BATCH_TTY_FD, termios.TCSADRAIN, _BATCH_TTY_ATTRS)  # type: ignore[arg-type]
+            except Exception as e:
+                print(f"Warning: could not restore TTY settings ({e}).")

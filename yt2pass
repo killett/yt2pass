@@ -1,0 +1,2806 @@
+#!/usr/bin/env python3
+"""
+Strict two-pass wrapper for yt-dlp that guarantees all *required* subtitles
+have been downloaded successfully before downloading media.
+
+By default, yt2pass only ever considers **human-made** subtitles.  
+Automatically generated captions / translations are *ignored* unless you pass
+the `--auto` flag.
+
+Pass 1 (subtitles only):
+    - Probes the video metadata once.
+    - Determines which of the requested subtitle languages are actually available.
+    - Runs yt-dlp with a "subs-first" config (slow, patient).
+    - Repeats with cooldowns until all required .srt files exist locally.
+
+    Required vs best-effort behavior:
+
+      • Without --auto:
+          - Only human-made subtitles are considered.
+          - For each requested language base in --langs, any human-made tracks
+            that exist are treated as required.
+          - If a requested language only exists as auto-captions/auto-translation,
+            it is treated as “not available” and is not fetched.
+
+      • With --auto:
+          - Human-made subtitles are still treated as required.
+          - The original-language track (if detectable) is also treated as required
+            even when it is only available as auto-captions.
+          - Additional auto-generated / auto-translated subtitles (i.e., languages
+            that exist *only* as auto) are treated as best-effort: yt2pass retries
+            them, but persistent HTTP 429s will cause those languages to be skipped
+            with a warning so the download can still succeed.
+
+      • With --auto and --strict:
+          - *All* requested subtitle languages (including auto-generated /
+            auto-translated ones) are treated as required.
+          - On repeated HTTP 429s, yt2pass uses a long (and increasing) backoff
+            between attempts (on the order of many minutes) and fails hard if any
+            requested language is still missing after max-tries.
+
+Pass 2 (media only):
+    - Runs yt-dlp with a media-only set of flags (no subtitle fetching).
+    - Embeds the already-downloaded .srt files into the final MKV.
+
+This program depends on yt-dlp, so it also checks that yt-dlp is installed and up to date.
+
+Written by Emmy Killett
+
+INSTALL PROCESS USING PIPX:
+
+# 0) Make sure ~/.local/bin is first on PATH for this session and future logins
+export PATH="$HOME/.local/bin:$PATH"
+grep -q 'export PATH="$HOME/.local/bin:$PATH"' ~/.profile || \
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
+
+# 1) Install pipx
+sudo apt-get update
+sudo apt-get install -y pipx
+pipx ensurepath   # ok to ignore the “restart shell” hint for now
+
+# 2) Install yt-dlp (nightly / pre-release) via pipx and FORCE re-link the shim
+pipx install --force --pip-args="--pre" yt-dlp
+
+# 3) Add the impersonation dependency inside THAT venv
+pipx runpip yt-dlp install --upgrade "curl_cffi>=0.6.0"
+pipx runpip yt-dlp install -U "yt-dlp[default]"
+
+# 4) (Recommended) Install a JS runtime so yt-dlp can solve YouTube’s JS challenges
+sudo apt-get install -y nodejs
+
+# 5) Verify the right binary is being used and the shim points to the venv
+command -v yt-dlp
+readlink -f ~/.local/bin/yt-dlp
+~/.local/share/pipx/venvs/yt-dlp/bin/yt-dlp -v --ignore-config --version
+
+# You should see in the verbose header:
+#   Optional libraries: ... curl_cffi ...
+#   JS runtimes: node
+
+TO UPGRADE:
+pipx upgrade --pip-args="--pre" yt-dlp
+
+TO INSTALL aria2c (optional downloader):
+sudo apt-get update
+sudo apt-get install -y aria2
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import argparse
+import logging
+import shlex
+import subprocess
+import time
+from pathlib import Path
+from typing import Iterable, Sequence
+import json
+import platform
+import shutil
+import random
+import glob
+import re
+import threading
+import select
+import signal
+
+IS_POSIX: bool = (os.name == "posix")
+if IS_POSIX:
+    import termios
+    import tty
+else:
+    termios = None  # type: ignore[assignment]
+    tty     = None  # type: ignore[assignment]
+
+__version__: str = "0.2.5"
+
+_ORIG_STDIN_ATTRS: list[int] | None = None
+_STDIN_FD:               int | None = None
+_YTDLP_EXE:              str | None = None  # Cached yt-dlp executable path string (after discovery)
+_PREFERRED_YT_CLIENT:    str | None = None
+
+
+class Options:
+    """Class that has all global options in one place."""
+
+    def __init__(self) -> None:
+        """Initialize the Options class with default values."""
+        self.my_name:                         str = Path(sys.argv[0]).stem
+
+        self.nosubs:                         bool = bool(0)  # Set to True (1) to skip subtitle pass
+        self.onlysubs:                       bool = bool(0)  # Set to True (1) to ONLY subtitle pass
+        self.auto:                           bool = bool(0)  # Set to True (1) to allow auto-captions
+        self.strict_mode_default:            bool = bool(0)  # Default for --strict flag
+        self.langs:                     list[str] = ["en", "fr", "orig"]  #, "es", "de", "ko", "zh"
+
+        # Resolution preferences (CLI flags)
+        self.prefer_720p:                    bool = bool(0)
+        self.prefer_smallest:                bool = bool(0)
+        self.go_low:                         bool = bool(0)  # Allow mp4-low-only fallback
+
+        # Per-language maximum attempts for subtitles/media.
+        # Strict-mode backoff might further cap the *effective* tries for repeated HTTP 429s.
+        self.max_tries:                       int =   5
+        self.cooldown_between_passes_secs:    int =  90
+        self.cooldown_between_sub_tries_secs: int = 180
+        self.rate_limit_kbps:                 int =   0  # 0 = no limit
+
+        # Base filename pattern, *without* extension. Used everywhere.
+        self.filename_pattern:                str = "%(title)s - %(uploader)s - ID %(id)s"
+
+        # Strict-mode backoff tuning
+        self.strict_sleep_base:               int =     3600  # minimum base cooldown (seconds)
+        self.strict_max_sleep:                int = 8 * 3600  # per-attempt cap for strict backoff (seconds)
+        self.strict_exp_base:                 int =        4  # exponential factor for strict backoff
+
+        # Sleep/backoff tuning (used by _sleep_with_countdown)
+        self.sleep_jitter_percent:          float =    0.12   # ± jitter for sleeps
+        self.sleep_min_secs:                  int =       5   # minimum sleep duration
+        self.sleep_log_step_secs:             int =    3600   # default step between countdown logs
+
+        # Probe / retry tuning
+        self.probe_max_outer:                 int =       5   # max outer probe attempts before failing
+        self.probe_retry_cooldown_secs:       int =       3   # base cooldown between probe attempts
+
+        # yt-dlp retry tuning for general (non-subs) calls
+        self.ytdlp_retry_sleep:               str = "15:45"   # base args retry sleep ("min:max")
+        self.ytdlp_min_extractor_retries:     int =      10   # floor for extractor retries in base args
+        self.ytdlp_extractor_retry_divisor:   int =       3   # divisor to derive extractor retries
+
+        # Subtitle-specific retry tuning
+        self.subs_sleep_requests_secs:        int =      20   # sleep between HTTP requests during subs pass
+        self.subs_retry_sleep:                str = "60:120"  # subtitle downloads retry sleep ("min:max")
+        self.subs_min_extractor_retries:      int =      20   # floor for extractor retries during subs pass
+
+        # Media fragment retry tuning
+        self.frag_retries_min:                int =       5   # transient 404s - try a few times
+        self.frag_retries_max:                int =      50   # permanent 404s - don't retry indefinitely
+
+        # Non-strict 429 handling (subtitles/media)
+        self.non_strict_429_factor:           int =       3   # multiplier of cooldown_between_tries
+        self.non_strict_429_min_sleep:        int =    1200   # minimum backoff on 429 in non-strict mode
+
+        # Auto-update tuning
+        self.update_stamp_age_secs:           int = 24 * 3600  # minimum time between auto-update attempts
+
+        self.log_mode:                        int = logging.INFO
+        self.args:      argparse.Namespace | None = None
+        if self.onlysubs and self.nosubs:
+            raise ValueError("Cannot use both options.onlysubs and options.nosubs together.")
+
+    @property
+    def strict_base_cooldown(self) -> int:
+        """
+        Effective base cooldown for strict-mode backoff: never shorter than either
+        strict_sleep_base or the user-configured --cooldown-between-tries.
+        ONLY CALL THIS AFTER parse_arguments HAS RUN AND POPULATED options.args!
+        """
+        return max(int(getattr(self.args, "cooldown_between_tries", 0) or 0),
+                   self.strict_sleep_base)
+
+    def output_template(self, prefix: str | None = None) -> str:
+        """
+        Full yt-dlp -o template including extension placeholder, optionally
+        prefixed (e.g., '003-').
+
+        Args:
+            prefix: Optional string to prefix the filename pattern with.
+        
+        Returns:
+            Full output template string for yt-dlp.
+        """
+        base = self.filename_pattern
+        if prefix:
+            base = f"{prefix}{base}"
+        return f"{base}.%(ext)s"
+
+
+# Single-key cancel (q/Q/n/N/ESC) is POSIX-only
+_CANCEL_KEYS = {b"q", b"Q", b"n", b"N", b"\x1b"}  # ESC
+
+# Single-key pause/resume (POSIX-only, when stdin is a TTY)
+_PAUSE_KEYS  = {b"p", b"P"}
+_RESUME_KEYS = {b"r", b"R"}
+
+# Track active child process group (for pausing yt-dlp) and pause state
+_ACTIVE_CHILD_PGID: int | None = None
+_PAUSED:                  bool = False
+
+# Lock to synchronize access from worker thread and main thread
+_PAUSE_LOCK = threading.Lock()
+
+_ISO639_2 = {
+    "en" : "eng",
+    "fr" : "fra",
+    "de" : "deu",
+    "es" : "spa",
+    "it" : "ita",
+    "pt" : "por",
+    "ru" : "rus",
+    "zh" : "zho",
+    "ja" : "jpn",
+    "ko" : "kor",
+    "ar" : "ara",
+    "hi" : "hin",
+    "nl" : "nld",
+    "sv" : "swe",
+    "no" : "nor",
+    "fi" : "fin",
+    "pl" : "pol",
+    "tr" : "tur",
+    "cs" : "ces",
+    "el" : "ell",
+}
+
+_LANG_TITLES = {
+    "en" : "English",
+    "fr" : "French",
+    "de" : "German",
+    "es" : "Spanish",
+    "it" : "Italian",
+    "pt" : "Portuguese",
+    "ru" : "Russian",
+    "zh" : "Chinese",
+    "ja" : "Japanese",
+    "ko" : "Korean",
+    "ar" : "Arabic",
+    "hi" : "Hindi",
+    "nl" : "Dutch",
+    "sv" : "Swedish",
+    "no" : "Norwegian",
+    "fi" : "Finnish",
+    "pl" : "Polish",
+    "tr" : "Turkish",
+    "cs" : "Czech",
+    "el" : "Greek",
+}
+
+
+def parse_arguments(options: Options) -> None:
+    """
+    Parse command-line arguments.
+
+    Args:
+        options: Options object to store parsed arguments. Contains:
+            - my_name:                         Name of the program.
+            - log_mode:                        Logging mode (default is logging.INFO).
+            - args:                            Parsed arguments will be stored here.
+            - langs:                           List of requested subtitle language bases.
+            - nosubs:                          Whether to skip the subtitles pass entirely.
+            - onlysubs:                        Whether to only do the subtitles pass.
+            - auto:                            Whether to allow auto-generated captions.
+            - strict:                          Whether to treat all requested languages as hard requirements.
+            - cooldown_between_passes_secs:    Seconds to wait between subtitle and media passes.
+            - cooldown_between_sub_tries_secs: Seconds to wait between subtitle retries.
+            - max_tries:                       Maximum subtitle attempts before failing.
+            - rate_limit_kbps:                 Download rate limit in kB/s (0 = no limit).
+            - aria:                            Whether to use aria2c as external downloader.
+
+    Returns:
+        None
+
+    Raises:
+        SystemExit: For -h/--help and -v/--version.
+    """
+
+    # ---- pre-parse: handle early-exit flags without requiring positionals ----
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--print-langs", action="store_true")
+    pre_args, remaining = pre.parse_known_args()
+
+    if pre_args.print_langs:
+        # keep this tiny and side-effect-free
+        for code, name in sorted(_LANG_TITLES.items()):
+            print(f"  {code}: {name}")
+        print("orig: original language (if detectable). This is a special code that may map to different languages per video.")
+        sys.exit(0)
+
+    # ---- full parser (normal behavior) ----
+    parser = argparse.ArgumentParser(
+        description=f"Strict two-pass yt-dlp wrapper. {options.my_name} version {__version__}"
+    )
+    parser.add_argument("-v", "--version", action="version",
+                        version=f"%(prog)s {__version__}")
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="Enable debug logging.")
+    parser.add_argument("--langs", default=",".join(options.langs),
+                        help=f"Required subtitle language bases (default: {','.join(options.langs)}). Human-made subs only by default; add --auto to allow auto captions. EXAMPLE: yt2pass --langs en,fr,ko 'https://youtu.be/VIDEOID'")
+    parser.add_argument("--print-langs", action="store_true",
+                        help="Print available language codes and names, then exit.")
+    parser.add_argument("--cooldown-between-passes", type=int, default=options.cooldown_between_passes_secs,
+                        help=f"Seconds to sleep between subtitle pass and media pass (default: {options.cooldown_between_passes_secs})")
+    parser.add_argument("--cooldown-between-tries", type=int, default=options.cooldown_between_sub_tries_secs,
+                        help=f"Seconds to sleep between subtitle retries (default: {options.cooldown_between_sub_tries_secs})")
+    parser.add_argument("--max-tries", type=int, default=options.max_tries,
+                        help=f"Maximum subtitle attempts before failing hard (default: {options.max_tries})")
+    parser.add_argument("--rate-limit", type=int, default=options.rate_limit_kbps,
+                        help=f"Limit download rate in kB/s (default: {options.rate_limit_kbps}.)"
+                              "0 = no limit. Applies to media/subtitle downloads, not metadata probes.")
+    parser.add_argument("--nosubs", action="store_true", default=options.nosubs,
+                        help=f"Skip the subtitles pass entirely (still embeds any existing .srt files. default: {options.nosubs}).")
+    parser.add_argument("--onlysubs", action="store_true", default=options.onlysubs,
+                        help=f"Download/check subtitles only, then exit (skip media pass. default: {options.onlysubs}).")
+    parser.add_argument("--auto", action="store_true", default=options.auto,
+                        help=f"Also allow auto-generated captions if human-made subs are not available. (default: {options.auto}).")
+    parser.add_argument("--strict", action="store_true", default=options.strict_mode_default,
+                        help=("Treat *all* requested subtitle languages as hard requirements "
+                              "(including auto-translated ones). On HTTP 429, use very long "
+                              "exponential backoff and fail the run if any requested language "
+                              "is still missing after max-tries."))
+    parser.add_argument("--720p", dest="prefer_720p",
+                        action="store_true", default=options.prefer_720p,
+                        help="Prefer 720p video when choosing formats (if available).")
+    parser.add_argument("--smallest", dest="prefer_smallest",
+                        action="store_true", default=options.prefer_smallest,
+                        help="Prefer the smallest available video resolution (lowest height).")
+    parser.add_argument("--go-low", action="store_true", default=options.go_low,
+                        help=("Allow downloads when the site only exposes the low-quality "
+                              "'mp4-low' video format. Without this flag, yt2pass treats "
+                              "mp4-low-only availability as a transient error and retries "
+                              "after a long cooldown."))
+    parser.add_argument("--po-token", default=os.getenv("YT_PO_TOKEN"),
+                        help="Advanced: YouTube PO token in the form CLIENT.CONTEXT+TOKEN. "
+                             "If set, used during the subtitles pass to request missing auto captions.")
+    parser.add_argument("--aria", action="store_true", default=False,
+                        help="Use aria2c as an external downloader for improved performance.")
+    parser.add_argument("url", nargs="?",
+                        help="Video/playlist URL (omit to just check yt-dlp and exit)")
+    parser.add_argument("extra", nargs=argparse.REMAINDER, default=[],
+                        help="Extra args to forward to yt-dlp (rarely needed)")
+    options.args = parser.parse_args(remaining)  # use remaining from pre-parse
+    langs_raw              = options.args.langs
+    options.args.langs     = [s.strip().lower() for s in langs_raw.split(",") if s.strip()]
+    options.args.max_tries = max(1, options.args.max_tries)
+    if options.args.debug:
+        options.log_mode = logging.DEBUG
+    if options.args.strict and not options.args.auto:
+        print("--strict used without --auto: only human-made subtitles are considered; "
+              "--strict will just make HTTP 429 handling more patient.")
+    if options.args.onlysubs and options.args.nosubs:
+        raise ValueError("Cannot use both --onlysubs and --nosubs together.")
+    if options.args.prefer_720p and options.args.prefer_smallest:
+        raise SystemExit("Cannot use --720p and --smallest together.")
+
+
+def main() -> None:
+    """
+    Main function.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
+    options = Options()
+
+    parse_arguments(options)
+    assert options.args is not None  # For mypy
+    logging.basicConfig(level=options.log_mode,
+                        format="%(asctime)s - %(levelname)s - %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
+
+    _ensure_ytdlp_available()
+    _validate_filename_pattern(options)
+    _start_cancel_key_listener()
+    _ensure_aria_if_requested(options)
+
+    if not _ffmpeg_available():
+        logging.warning("ffmpeg not found on PATH. Subtitles may remain as .vtt/.ass; "
+                        "conversion to .srt (requested via --convert-subs srt) will be skipped.")
+
+    _check_ytdlp_version(options)
+
+    if not options.args.url:
+        logging.info("No URL provided; exiting after yt-dlp check.")
+        sys.exit(0)
+
+    url:         str = options.args.url
+    extra: list[str] = options.args.extra
+
+    mode = "onlysubs" if options.args.onlysubs else ("nosubs" if options.args.nosubs else "normal")
+    logging.info("Starting yt2pass: url=%s | langs=%s | mode=%s",
+                 url, " ".join(options.args.langs), mode)
+    # Fast probe to determine if this is a playlist
+    try:
+        info = _probe_info(options, url)
+    except Exception as e:
+        logging.error("Failed to probe URL: %s", e)
+        sys.exit(3)
+
+    is_playlist = (info.get("_type") == "playlist") or bool(info.get("entries"))
+
+    if not is_playlist:  # Single video – do the normal two-pass flow
+        rc = _process_single(options, url, extra, prefix=None, info=info)
+        if rc != 0:
+            sys.exit(rc)
+    else:                # Playlist – iterate entries
+        entries = [e for e in (info.get("entries") or []) if e]
+        n = len(entries)
+        if n == 0:
+            logging.error("Playlist has no entries.")
+            sys.exit(3)
+
+        width = len(str(n))
+        logging.info("Detected playlist with %d items.", n)
+
+        failed_items: list[tuple[int, str, int]] = []
+
+        # Process each entry individually
+        for i, entry in enumerate(entries, start=1):
+            item_url = _entry_url(entry)
+            if not item_url:
+                logging.warning("Skipping entry %d: no usable URL.", i)
+                continue
+
+            prefix = f"{i:0{width+1}d} - "  # Add an extra zero so the playlist can expand if necessary
+
+            # Playlist resume: best-effort guess of the title base from the
+            # shallow entry metadata so we can cheaply skip items whose media
+            # was already downloaded in a previous run.
+            title_hint = _title_base_from_metadata(options, entry, prefix=prefix)
+            if _have_media_for_title_base(title_hint):
+                logging.info("Skipping item %d/%d: media file already exists for %s "
+                             "(playlist resume).", i, n, title_hint or "<unknown>")
+                continue
+
+            # Fallback: match any media file by video ID alone
+            # (covers renamed / annotated files).
+            entry_vid = _sanitize_filename_component((entry.get("id") or "").strip())
+            id_hit    = _find_media_by_video_id(entry_vid) if entry_vid else None
+            if id_hit:
+                logging.info("Skipping item %d/%d: found existing media by video ID %s: %s "
+                             "(filename was modified since download).",
+                             i, n, entry_vid, id_hit.name)
+                if title_hint:
+                    _symlink_media_alias(title_hint, id_hit)
+                continue
+
+            logging.info("Processing item %d/%d: %s", i, n, item_url)
+            # Do not pass pre-probed info down to _process_single(); playlist
+            # entries are shallow and often lack formats/subtitles.
+
+            rc = _process_single(options, item_url, extra, prefix=prefix, info=None)
+            if rc != 0:
+                logging.error(
+                    "Item %d/%d FAILED with rc=%d; skipping this item and continuing.",
+                    i, n, rc)
+                failed_items.append((i, item_url, rc))
+                continue
+
+        if failed_items:
+            logging.warning("Playlist completed with %d failed item(s):", len(failed_items))
+            for idx, item_url, rc in failed_items:
+                logging.warning("  #%d (rc=%d): %s", idx, rc, item_url)
+        else:
+            logging.info("Playlist completed successfully.")
+
+    logging.info("Done.")
+
+    logging.shutdown()
+
+
+def _validate_filename_pattern(options: Options) -> None:
+    """
+    Validate the user-supplied filename pattern by attempting to format it.
+
+    Args:
+        options: Options object containing the filename pattern.
+
+    Returns:
+        None
+
+    Raises:
+        SystemExit: If the filename pattern is invalid.
+    """
+    try:
+        # dry-run with dummy values
+        options.filename_pattern % {"uploader": "u",
+                                    "title"   : "t",
+                                    "id"      : "id"}
+    except KeyError as e:
+        raise SystemExit(f"Invalid filename pattern (unknown placeholder {e!r})") from e
+    except Exception as e:
+        raise SystemExit(f"Invalid filename pattern: {e}") from e
+
+
+def _base_args(options: Options, *, fast: bool = False) -> list[str]:
+    """
+    Shared yt-dlp args.
+    fast=True  -> omit sleeps/long retries and any rate limiting (for probes).
+    fast=False -> include normal sleeps/retries; respect --rate-limit if set.
+    """
+    args = ["--cookies-from-browser", "firefox",
+            "--no-overwrites",
+            "--audio-multistreams",
+            "--merge-output-format", "mkv",
+            "-o", options.output_template(),
+            "--concurrent-fragments", "1"]
+    if not fast:
+        # General retry tuning
+        div = max(1, options.ytdlp_extractor_retry_divisor)
+        args += ["--retries", str(options.args.max_tries),
+                 "--retry-sleep", options.ytdlp_retry_sleep,
+                 "--extractor-retries",
+                 str(max(options.ytdlp_min_extractor_retries,
+                         options.args.max_tries // div))]
+        # Apply user rate limit if provided (kB/s -> "NNNK")
+        if options.args and getattr(options.args, "rate_limit", 0):
+            k = int(options.args.rate_limit)
+            if k > 0:
+                args += ["--limit-rate", f"{k}K"]
+    # If requested, prefer aria2c for external downloading
+    if options.args and getattr(options.args, "aria", False):
+        args += ["--external-downloader", "aria2c",
+                 "--external-downloader-args", "aria2c:-x 16 -k 1M"]
+    return args
+
+
+def _subs_args(options: Options, sub_langs_arg: str) -> list[str]:
+    """Arguments for yt-dlp that are specific to the subtitles pass."""
+    div = max(1, options.ytdlp_extractor_retry_divisor)
+    args = [
+        "--skip-download",
+        "--write-subs",
+        "--convert-subs", "srt",
+        "--sleep-requests", str(options.subs_sleep_requests_secs),
+        "--retries", str(options.args.max_tries),
+        "--retry-sleep", options.subs_retry_sleep,
+        "--extractor-retries",
+        str(max(options.subs_min_extractor_retries,
+                options.args.max_tries // div)),
+        "--concurrent-fragments", "1",
+        "--sub-langs", sub_langs_arg,
+    ]
+    # If --auto was supplied, request auto-captions too
+    if getattr(options.args, "auto", False):
+        args.append("--write-auto-subs")
+    # If a valid PO token was supplied, merge it with the player_client so we
+    # don't clobber extractor-args from _base_args(). Last occurrence wins.
+    po = getattr(options.args, "po_token", None)
+    if po:
+        args += ["--extractor-args", f"youtube:player_client=tv_embedded;po_token={po}"]
+    return args
+
+
+def _media_args(options: Options) -> list[str]:
+    """Arguments for yt-dlp that are specific to the media pass."""
+    # Use a high but finite number of fragment retries so we don't hang forever
+    # on permanent 404s. Tie it loosely to max_tries but clamp to a sane range.
+    max_tries    = getattr(options.args, "max_tries", 10) if options.args else 10
+    frag_retries = max(options.frag_retries_min,
+                       min(options.frag_retries_max, max_tries))
+    return [
+        "--no-write-subs",
+        "--no-write-auto-subs",
+        "--embed-subs",                # always embed subs if present on disk (even with --nosubs)
+        "--fragment-retries", str(frag_retries),
+        "--file-access-retries", str(max_tries),
+    ]
+
+
+def _os_name() -> str:
+    """Return a simple OS name: 'Windows' | 'macOS' | 'Linux' | '<Other>'."""
+    s = platform.system()
+    if s == "Darwin":
+        return "macOS"
+    if s in ("Linux", "Windows"):
+        return s
+    return s or "Unknown"
+
+
+def _print_install_help_and_exit() -> None:
+    osn = _os_name()
+    msg = ["yt-dlp is not installed or not on PATH.\n"]
+    if osn == "Linux":
+        msg += [
+            "Install one of the following ways:",
+            "  1) System-wide standalone (Ubuntu-friendly, recommended):",
+            "     curl -L -o /tmp/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
+            "     sudo install -m 755 /tmp/yt-dlp /usr/local/bin/yt-dlp",
+            "  2) Per-user standalone (no sudo):",
+            "     curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \\",
+            "          -o ~/.local/bin/yt-dlp && chmod a+rx ~/.local/bin/yt-dlp",
+            "     # Ensure ~/.local/bin is in your PATH (e.g., add to ~/.profile and re-login)",
+            "  3) pipx:",
+            "     pipx install yt-dlp",
+            "  4) pip (if you must):",
+            "     python3 -m pip install --upgrade yt-dlp",
+        ]
+    elif osn == "macOS":
+        msg += [
+            "Install one of the following ways:",
+            "  1) Homebrew:",
+            "     brew install yt-dlp",
+            "  2) Standalone binary:",
+            "     curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \\",
+            "          -o /usr/local/bin/yt-dlp && sudo chmod a+rx /usr/local/bin/yt-dlp",
+            "  3) pipx:",
+            "     pipx install yt-dlp",
+        ]
+    elif osn == "Windows":
+        msg += [
+            "Install one of the following ways:",
+            "  1) winget:",
+            "     winget install yt-dlp.yt-dlp",
+            "  2) Scoop:",
+            "     scoop install yt-dlp",
+            "  3) Standalone EXE:",
+            "     Download https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+            "     and put it somewhere on your PATH (e.g., %USERPROFILE%\\bin)",
+            "  4) pipx:",
+            "     pipx install yt-dlp",
+        ]
+    else:
+        msg += [
+            f"Detected OS: {osn}.",
+            "Try the standalone binary from GitHub releases:",
+            "  https://github.com/yt-dlp/yt-dlp/releases/latest",
+        ]
+    # Print to stderr (we're pre-logging), then exit with a distinct code.
+    msg += [
+        "",
+        "Recommended: yt-dlp's nightly channel has daily builds with the latest fixes.",
+        "After installing, you can switch with:",
+        "  yt-dlp --update-to nightly    # add 'sudo' if your binary lives in /usr/local/bin",
+    ]
+    print("\n".join(msg), file=sys.stderr)
+    sys.exit(2)
+
+
+def _print_aria_install_help() -> None:
+    """
+    Print OS-specific hints for installing aria2c.
+    This is advisory only and does NOT exit; used when --aria is requested
+    but aria2c is missing or not working.
+    """
+    osn = _os_name()
+    msg = ["aria2c is not installed or not on PATH.\n"]
+    if osn == "Linux":
+        msg += [
+            "Install aria2c with one of the following:",
+            "  sudo apt-get update && sudo apt-get install -y aria2",
+            "or:",
+            "  sudo dnf install aria2",
+            "or:",
+            "  sudo pacman -S aria2",
+        ]
+    elif osn == "macOS":
+        msg += [
+            "Install aria2c with Homebrew:",
+            "  brew install aria2",
+        ]
+    elif osn == "Windows":
+        msg += [
+            "Install aria2c using a package manager or manual download:",
+            "  winget install aria2.aria2",
+            "or:",
+            "  choco install aria2",
+            "or download from:",
+            "  https://aria2.github.io/",
+        ]
+    else:
+        msg += [
+            f"Detected OS: {osn}.",
+            "See the official aria2 project page for installation options:",
+            "  https://aria2.github.io/",
+        ]
+    msg += [
+        "",
+        "NOTE: yt2pass will fall back to yt-dlp's built-in downloader when aria2c",
+        "is not available, even if --aria was requested.",
+    ]
+    print("\n".join(msg), file=sys.stderr)
+
+
+def _update_instructions() -> str:
+    """
+    Return OS-specific instructions for updating yt-dlp as a multi-line string.
+    Intended to be used inside logged messages (post-logging initialization).
+    """
+    osn = _os_name()
+    header = [
+        "Recommended (nightly channel):",
+        "  yt-dlp --update-to nightly    # add 'sudo' if binary is in /usr/local/bin",
+        "If you use pip/pipx, install pre-releases to stay on nightly:",
+        "  pipx upgrade --pip-args=\"--pre\" yt-dlp",
+        "  python3 -m pip install --pre -U yt-dlp",
+        "",
+        "Stable channel (manual methods):",  # fallbacks below
+    ]
+    if osn == "Linux":
+        lines = [
+            "Update on Linux (system-wide):",
+            "  curl -L -o /tmp/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
+            "  sudo install -m 755 /tmp/yt-dlp /usr/local/bin/yt-dlp",
+            "Or per-user (no sudo):",
+            "  curl -L -o ~/.local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp && chmod a+rx ~/.local/bin/yt-dlp",
+            "If installed via pipx:",
+            "  pipx upgrade yt-dlp",
+            "If installed via pip:",
+            "  python3 -m pip install --upgrade yt-dlp"
+        ]
+    elif osn == "macOS":
+        lines = [
+            "Update instructions:",
+            "  1) Homebrew:",
+            "     brew upgrade yt-dlp",
+            "  2) Standalone binary:",
+            "     sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \\",
+            "          -o /usr/local/bin/yt-dlp && sudo chmod a+rx /usr/local/bin/yt-dlp",
+            "  3) pipx:",
+            "     pipx upgrade yt-dlp",
+        ]
+    elif osn == "Windows":
+        lines = [
+            "Update instructions:",
+            "  1) winget:",
+            "     winget upgrade yt-dlp.yt-dlp",
+            "  2) Scoop:",
+            "     scoop update yt-dlp",
+            "  3) Standalone EXE:",
+            "     Download the new yt-dlp.exe and replace the one on your PATH",
+            "     (https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe)",
+            "  4) pipx:",
+            "     pipx upgrade yt-dlp",
+        ]
+    else:
+        lines = [
+            f"Detected OS: {osn}.",
+            "Update from the latest release page:",
+            "  https://github.com/yt-dlp/yt-dlp/releases/latest",
+        ]
+    return "\n".join(header + lines)
+
+
+def _guess_ytdlp_update_cmd(exe: str) -> list[str]:
+    """
+    Best-effort guess of how to update yt-dlp based on where its binary lives.
+
+    Returns a argv-style list suitable for subprocess.run.
+
+    Args:
+        exe: Path to the yt-dlp executable.
+    
+    Returns:
+        A list of command-line arguments for updating yt-dlp.
+    """
+    p = Path(exe)
+    s = str(p)
+
+    # 1) Heuristic: pipx layout (.../pipx/venvs/yt-dlp/bin/yt-dlp)
+    if shutil.which("pipx") and "pipx" in s and "venvs" in s and "yt-dlp" in s:
+        return ["pipx", "upgrade", "--pip-args=--pre", "yt-dlp"]
+
+    # 2) Heuristic: pipx is installed and knows about yt-dlp at all.
+    if shutil.which("pipx"):
+        try:
+            cp = subprocess.run(["pipx", "list", "--short"],
+                                check=False, capture_output=True, text=True, timeout=5)
+            if cp.returncode == 0 and any("yt-dlp" in line for line in (cp.stdout or "").splitlines()):
+                return ["pipx", "upgrade", "--pip-args=--pre", "yt-dlp"]
+        except Exception:
+            pass
+
+    # 3) Fallback: self-update to nightly (works for standalones and many others)
+    return [exe, "--update-to", "nightly"]
+
+
+def _ytdlp_update_stamp_path(exe: str) -> Path:
+    """
+    Return a user-writable cache path for the yt-dlp last-update stamp file.
+
+    We intentionally do NOT write next to the yt-dlp binary (e.g. /usr/local/bin),
+    because that is often not writable without sudo and would cause repeated update
+    attempts every run.
+    """
+    p = Path(exe)
+
+    if os.name == "nt":
+        # Prefer LOCALAPPDATA on Windows; fall back to a sane default.
+        cache_root = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        cache_dir = cache_root / "yt2pass"
+    else:
+        # Respect XDG cache if present; otherwise ~/.cache
+        cache_root = Path(os.getenv("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+        cache_dir = cache_root / "yt2pass"
+
+    return cache_dir / f"{p.name}.last_update.txt"
+
+
+def _find_ytdlp_exe() -> str | None:
+    """
+    Best-effort discovery of yt-dlp executable.
+    - Uses cached _YTDLP_EXE if set
+    - Else tries shutil.which("yt-dlp")
+    - Caches the result if found
+    - Returns None if not found
+
+    Args:
+        None
+
+    Returns:
+        The path to the yt-dlp executable, or None if not found.
+    """
+    global _YTDLP_EXE
+    if _YTDLP_EXE:
+        return _YTDLP_EXE
+    exe = shutil.which("yt-dlp")
+    if exe:
+        _YTDLP_EXE = exe
+        return exe
+    return None
+
+
+def _ytdlp_exe_required() -> str:
+    """
+    Same as _find_ytdlp_exe, but fatal if yt-dlp is not found.
+    Use this in code paths where yt-dlp MUST exist (main flow).
+
+    Args:
+        None
+    
+    Returns:
+        The path to the yt-dlp executable.
+    
+    Raises:
+        SystemExit: If yt-dlp is not found.
+    """
+    exe = _find_ytdlp_exe()
+    if not exe:
+        _print_install_help_and_exit()
+        # _print_install_help_and_exit() does sys.exit, so this return is never reached,
+        # but it keeps type checkers happy:
+        raise SystemExit(2)
+    return exe
+
+
+def _maybe_auto_update_ytdlp(options: Options) -> None:
+    """
+    If it's been more than "options.update_stamp_age_secs" since we last
+    *attempted* a yt-dlp update, try to update it and then 'touch' the stamp file.
+
+    This is best-effort and never fatal; failures are logged as warnings.
+
+    Args:
+        options: Options object containing:
+            - update_stamp_age_secs:   Minimum time between auto-update attempts.
+    
+    Returns:
+        None
+    """
+    exe = _find_ytdlp_exe()
+    if not exe:
+        return
+
+    stamp = _ytdlp_update_stamp_path(exe)
+    now   = time.time()
+
+    # Check stamp age; if newer than threshold, do nothing.
+    try:
+        mtime = stamp.stat().st_mtime
+        if now - mtime < options.update_stamp_age_secs:
+            return
+    except FileNotFoundError:
+        # No stamp -> treat as "never updated"; proceed.
+        pass
+    except OSError:
+        # Some weird FS issue; don't block the main program.
+        return
+
+    cmd = _guess_ytdlp_update_cmd(exe)
+    logging.info("Attempting yt-dlp auto-update via: %s",
+                 " ".join(shlex.quote(c) for c in cmd))
+
+    try:
+        cp = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except Exception as e:
+        logging.warning("yt-dlp auto-update command failed to run: %s", e)
+    else:
+        if cp.returncode == 0:
+            new_ver = _local_ytdlp_version()
+            if new_ver:
+                logging.info("yt-dlp auto-updated successfully; current version is %s", new_ver)
+            else:
+                logging.info("yt-dlp auto-update command completed successfully, but could not determine new version.")
+        else:
+            logging.warning("yt-dlp auto-update command exited with rc=%d", cp.returncode)
+            if cp.stderr:
+                if logging.getLogger().isEnabledFor(logging.DEBUG): logging.debug("yt-dlp(auto-update) stderr: %s", cp.stderr.strip())
+
+    # Touch the stamp regardless of success, so we don't hammer updates.
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except Exception:
+        if logging.getLogger().isEnabledFor(logging.DEBUG): logging.debug("Could not write yt-dlp update stamp file at %s", stamp)
+
+
+def _ensure_ytdlp_available() -> None:
+    """
+    Ensure yt-dlp is installed and runnable. If not, print OS-specific
+    install instructions and exit. Keep this pre-logging and quiet.
+    """
+    exe = _ytdlp_exe_required()  # fatal if missing
+
+    try:
+        cp = subprocess.run(
+            [exe, "--version"],
+            check=False, capture_output=True, text=True, timeout=5
+        )
+    except FileNotFoundError:
+        _print_install_help_and_exit()
+    except Exception as e:
+        # yt-dlp exists but failed oddly; still give install/repair guidance.
+        print(f"yt-dlp could not be executed: {e}", file=sys.stderr)
+        _print_install_help_and_exit()
+
+    if cp.returncode != 0:
+        print(f"yt-dlp returned non-zero ({cp.returncode}): {cp.stderr.strip()}", file=sys.stderr)
+        _print_install_help_and_exit()
+
+
+def _local_ytdlp_version() -> str | None:
+    """Get the local yt-dlp version."""
+    exe = _find_ytdlp_exe()
+    if not exe:
+        return None
+    try:
+        cp = subprocess.run([exe, "--version"], check=False, capture_output=True, text=True, timeout=5)
+        v = (cp.stdout or "").strip().splitlines()[0].strip()
+        return v or None
+    except Exception:
+        return None
+
+
+def _check_ytdlp_version(options: Options) -> None:
+    """
+    Log the locally installed yt-dlp version and, at most once per
+    options.update_stamp_age_secs window, trigger the auto-update helper.
+    
+    Args:
+        options: Options object containing:
+            - update_stamp_age_secs:   Minimum time between auto-update attempts.
+    
+    Returns:
+        None
+    """
+    local = _local_ytdlp_version()
+    if not local:
+        logging.warning("Could not determine local yt-dlp version.")
+        return
+
+    logging.info("yt-dlp installed: version %s", local)
+
+    # Let the helper decide whether it's time to auto-update and to manage
+    # the shared stamp file.
+    _maybe_auto_update_ytdlp(options)
+
+
+def _ffmpeg_available() -> bool:
+    """Check if ffmpeg is available on PATH."""
+    return shutil.which("ffmpeg") is not None
+
+
+def _ensure_aria_if_requested(options: Options) -> None:
+    """
+    If --aria was requested, verify that aria2c is installed and runnable.
+    If the check fails, log a warning, print install hints, and disable --aria.
+
+    Args:
+        options: Options object containing:
+            - args.aria: Whether the user requested aria2c.
+    """
+    if not (options.args and getattr(options.args, "aria", False)):
+        return
+
+    exe = shutil.which("aria2c")
+    if not exe:
+        logging.warning("aria2c was requested via --aria but is not on PATH; disabling aria mode.")
+        _print_aria_install_help()
+        options.args.aria = False
+        return
+
+    try:
+        cp = subprocess.run([exe, "--version"],
+                            check=False, capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        logging.warning("aria2c was requested via --aria but could not be executed: %s; disabling aria mode.", e)
+        _print_aria_install_help()
+        options.args.aria = False
+        return
+
+    if cp.returncode != 0:
+        logging.warning("aria2c --version returned non-zero (%s); disabling aria mode.", cp.returncode)
+        if cp.stderr:
+            if logging.getLogger().isEnabledFor(logging.DEBUG): logging.debug("aria2c(stderr): %s", cp.stderr.strip())
+        _print_aria_install_help()
+        options.args.aria = False
+        return
+
+    logging.info("aria2c detected at %s; external downloader will be enabled.", exe)
+
+
+def _restore_stdin_termios() -> None:
+    """
+    Best-effort restore of the original stdin termios settings on POSIX.
+    """
+    if not IS_POSIX:
+        return
+
+    global _ORIG_STDIN_ATTRS, _STDIN_FD
+    if _ORIG_STDIN_ATTRS is None or _STDIN_FD is None:
+        return
+
+    try:
+        termios.tcsetattr(_STDIN_FD, termios.TCSADRAIN, _ORIG_STDIN_ATTRS)  # type: ignore[arg-type]
+    except termios.error:
+        pass
+
+    _ORIG_STDIN_ATTRS = None
+    _STDIN_FD = None
+
+
+def _cancel_key_worker() -> None:
+    """
+    Background worker that listens for single-key cancels (q/Q/n/N/Esc) and
+    triggers a KeyboardInterrupt-equivalent by sending SIGINT to this process.
+
+    Only active when stdin is a TTY on POSIX; otherwise it exits immediately.
+    """
+    if not IS_POSIX:
+        return
+
+    if not sys.stdin.isatty():
+        return
+
+    global _ORIG_STDIN_ATTRS, _STDIN_FD, _PAUSED
+
+    try:
+        fd = sys.stdin.fileno()
+    except (OSError, AttributeError):
+        return
+
+    _STDIN_FD = fd
+
+    # Capture original termios once.
+    if _ORIG_STDIN_ATTRS is None:
+        try:
+            _ORIG_STDIN_ATTRS = termios.tcgetattr(fd)  # type: ignore[arg-type]
+        except termios.error:  # type: ignore[union-attr]
+            _ORIG_STDIN_ATTRS = None
+            return
+
+    # Put stdin into cbreak mode for the lifetime of this process.
+    try:
+        tty.setcbreak(fd)  # type: ignore[arg-type]
+    except termios.error:  # type: ignore[union-attr]
+        return
+
+    try:
+        while True:
+            # Poll for input with a short timeout so we don't block shutdown
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if not r:
+                continue
+            try:
+                ch = os.read(fd, 1)
+            except OSError:
+                break
+            if not ch:
+                break
+
+            # Cancel keys (q/Q/n/N/ESC)
+            if ch in _CANCEL_KEYS:
+                sys.stderr.write("\n[yt2pass] Cancel key pressed; aborting current run...\n")
+                sys.stderr.flush()
+                try:
+                    os.kill(os.getpid(), signal.SIGINT)
+                except Exception:
+                    pass
+                break
+
+            # Pause key (p/P) – pause active yt-dlp child process group
+            if ch in _PAUSE_KEYS:
+                with _PAUSE_LOCK:
+                    pgid = _ACTIVE_CHILD_PGID
+                    if pgid is None:
+                        continue
+                    if not _PAUSED:
+                        _PAUSED = True
+                        pgid = _ACTIVE_CHILD_PGID
+                    else:
+                        pgid = None
+                if pgid is not None:
+                    try:
+                        os.killpg(pgid, signal.SIGSTOP)
+                    except Exception:
+                        pass
+                sys.stderr.write("\n[yt2pass] Paused. Hit 'r' to resume.\n")
+                sys.stderr.flush()
+                continue
+
+            # Resume key (r/R) – resume active yt-dlp child process group
+            if ch in _RESUME_KEYS:
+                with _PAUSE_LOCK:
+                    if _PAUSED:
+                        _PAUSED = False
+                        pgid = _ACTIVE_CHILD_PGID
+                    else:
+                        pgid = None
+
+                # If we weren't paused (pgid is None), do nothing at all.
+                if pgid is None:
+                    continue
+
+                try:
+                    os.killpg(pgid, signal.SIGCONT)
+                except Exception:
+                    pass
+                sys.stderr.write("\n[yt2pass] Resuming...\n")
+                sys.stderr.flush()
+                continue
+    finally:
+        # For safety: restore TTY state on exit in case of any uncaught exceptions or signals, to avoid leaving the terminal in a broken state. 
+        _restore_stdin_termios()
+
+
+_CANCEL_LISTENER_STARTED: bool = False
+
+
+def _start_cancel_key_listener() -> None:
+    """
+    Start a daemon thread that listens for cancel and pause/resume keys.
+    Safe to call once near program startup after logging is configured.
+    """
+    global _CANCEL_LISTENER_STARTED
+    if not IS_POSIX or _CANCEL_LISTENER_STARTED or not sys.stdin.isatty():
+        return
+    t = threading.Thread(target=_cancel_key_worker, daemon=True)
+    t.start()
+    _CANCEL_LISTENER_STARTED = True
+
+
+def _sleep_with_countdown(options: Options,
+                          total: int,
+                          step: int | None = None) -> None:
+    """
+    Sleep with periodic log updates.
+
+    Args:
+        options: Options object providing jitter/min/log-step tuning.
+        total:   Total seconds to sleep (randomized with ±jitter, min sleep_min_secs).
+        step:    Step size for logging updates (defaults to options.sleep_log_step_secs).
+
+    Returns:
+        None
+    """
+    jitter_percent = options.sleep_jitter_percent
+    remaining = int(total + random.uniform(-jitter_percent * total,
+                                           jitter_percent * total))
+    remaining = max(options.sleep_min_secs, remaining)
+    if step is None:
+        step = options.sleep_log_step_secs
+
+    while remaining > 0:
+        chunk = min(step, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+        if remaining >= step:
+            logging.info("…%d s remaining in cooldown", remaining)
+
+
+def _run(cmd: Sequence[str],
+         cwd: str | os.PathLike[str] | None = None,
+         check: bool = True) -> subprocess.CompletedProcess:
+    """
+    Run a command with subprocess.run and optional error checking.
+
+    Args:
+        cmd:  Command and arguments as a sequence (already shell-escaped if needed).
+        cwd:  Working directory to run in (optional).
+        check: If True, raise CalledProcessError on non-zero exit.
+
+    Returns:
+        CompletedProcess with stdout/stderr.
+
+    Raises:
+        subprocess.CalledProcessError: If check=True and the command fails.
+    """
+    if logging.getLogger().isEnabledFor(logging.DEBUG): logging.debug("RUN: %s", " ".join(shlex.quote(c) for c in cmd))
+    return subprocess.run(cmd, cwd=None if cwd is None else os.fspath(Path(cwd)),
+                          check=check, text=True, capture_output=True)
+
+
+def _run_streaming(cmd: Sequence[str],
+                   cwd: str | os.PathLike[str] | None = None,
+                   check: bool = True) -> int:
+    """
+    Run a command and stream output directly to the terminal.
+
+    On POSIX, the child is put in its own process group so we can send
+    SIGSTOP/SIGCONT for pause/resume via the keyboard listener.
+    """
+    global _ACTIVE_CHILD_PGID, _PAUSED
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug("RUN(stream): %s", " ".join(shlex.quote(c) for c in cmd))
+
+    # Let the user know about hotkeys before starting a streaming run.
+    if IS_POSIX and sys.stdin.isatty():
+        sys.stderr.write("[yt2pass] Keys during download: q/n/Esc = cancel, p = pause, r = resume.\n")
+        sys.stderr.flush()
+
+    if not IS_POSIX:
+        # Non-POSIX: fall back to the original simple behavior.
+        rc = subprocess.call(cmd, cwd=None if cwd is None else os.fspath(Path(cwd)))
+        if check and rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd)
+        return rc
+
+    with _PAUSE_LOCK:
+        _ACTIVE_CHILD_PGID = None   # clear any stale value
+        _PAUSED            = False  # reset stale pause state
+
+    proc = subprocess.Popen(cmd,
+                            cwd=None if cwd is None else os.fspath(Path(cwd)),
+                            preexec_fn=os.setsid)  # new session & process group
+
+    # Record the child's process group ID so the key worker can signal it.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    with _PAUSE_LOCK:
+        _ACTIVE_CHILD_PGID = pgid
+
+    try:
+        try:
+            rc = proc.wait()
+        except KeyboardInterrupt:
+            try:
+                os.killpg(pgid, signal.SIGINT)
+            except Exception:
+                pass
+            raise
+    finally:
+        with _PAUSE_LOCK:
+            if _ACTIVE_CHILD_PGID == pgid:
+                _ACTIVE_CHILD_PGID = None
+            _PAUSED = False   # reset on exit
+
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
+    return rc
+
+
+def _ytdlp(*args: str) -> subprocess.CompletedProcess:
+    """
+    Convenience wrapper for calling yt-dlp with text output captured.
+
+    Args:
+        *args: yt-dlp arguments (each a single token, no shell parsing).
+
+    Returns:
+        CompletedProcess.
+    """
+    exe = _ytdlp_exe_required()
+    return _run((exe,) + args, check=False)
+
+
+def _ytdlp_streaming(*args: str) -> int:
+    """yt-dlp with stdout/stderr streaming to the terminal."""
+    exe = _ytdlp_exe_required()
+    return _run_streaming((exe,) + args, check=False)
+
+
+def _probe_client_argsets() -> list[list[str]]:
+    """
+    Ordered client fallbacks for metadata probing.
+    Each inner list will override any earlier --extractor-args in _base_args,
+    because yt-dlp uses the last occurrence.
+    """
+    return [
+        # tv_embedded is usually pretty chill and doesn't trigger SABR as aggressively
+        ["--extractor-args", "youtube:player_client=tv_embedded"],
+        # web with Node+EJS (can solve signatures but may hit SABR URLs)
+        ["--extractor-args", "youtube:player_client=web", "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=web", "--no-cookies", "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        # mweb (may want PO tokens, but sometimes gives playable HLS without SABR)
+        ["--extractor-args", "youtube:player_client=mweb", "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        # tv_html5_embed (can be great, sometimes crashes)
+        ["--extractor-args", "youtube:player_client=tv_html5_embed"],
+        # lightweight app probes last
+        ["--extractor-args", "youtube:player_client=android", "--no-cookies"],
+        ["--extractor-args", "youtube:player_client=ios",     "--no-cookies"],
+    ]
+
+
+def _client_name_for_argset(argset: Sequence[str]) -> str:
+    """
+    Extract the youtube:player_client name from a yt-dlp --extractor-args set.
+    
+    Args:
+        argset: Sequence of yt-dlp arguments.
+    
+    Returns:
+        A simple string like 'tv_embedded', 'web', 'mweb', 'android', 'ios',
+        or 'unknown' if not present.
+    """
+    for part in argset:
+        if isinstance(part, str) and part.startswith("youtube:player_client="):
+            return part.split("=", 1)[1]
+    return "unknown"
+
+
+def _ordered_probe_client_argsets() -> list[list[str]]:
+    """
+    Return probe client argsets, optionally reordered so that the last known
+    successful client (_PREFERRED_YT_CLIENT) is tried first.
+    """
+    base      = _probe_client_argsets()
+    preferred = _PREFERRED_YT_CLIENT
+    if not preferred:
+        return base
+
+    preferred_list: list[list[str]] = []
+    others:         list[list[str]] = []
+    for a in base:
+        (preferred_list if _client_name_for_argset(a) == preferred else others).append(a)
+
+    # Only reorder if we actually found that client
+    if preferred_list:
+        return preferred_list + others
+    return base
+
+
+def _probe_common_flags() -> list[str]:
+    """Make -J resilient when no playable formats are exposed (SABR, etc.)."""
+    return [
+        "--ignore-no-formats-error",  # don't fail -J if no formats are available
+        "--skip-download",            # ensure no format selection/download paths run
+    ]
+
+
+def _probe_info(options: Options, url: str) -> dict:
+    """Fetch full metadata with small retries and multi-client fallback."""
+    global _PREFERRED_YT_CLIENT
+    max_outer = min(options.probe_max_outer, options.args.max_tries)
+    for outer_try in range(1, max_outer + 1):
+        for argset in _ordered_probe_client_argsets():
+            cp = _ytdlp(
+                *_base_args(options, fast=True),
+                *argset,
+                *_probe_common_flags(),
+                "-J", url
+            )
+            if cp.returncode == 0 and (cp.stdout or "").strip():
+                try:
+                    info = json.loads(cp.stdout)
+                except Exception as je:
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug("Probe JSON parse failed: %s", je)
+                else:  # try-except-else runs the else block only if no exception occurred
+                    # Remember which client worked so we can try it first next time
+                    _PREFERRED_YT_CLIENT = _client_name_for_argset(argset)
+                    return info
+            else:
+                # Show a short, helpful snippet of stderr for this attempt
+                msg  = (cp.stderr or "").strip().splitlines()
+                tail = " | ".join(msg[-3:]) if msg else "<no stderr>"
+                # Detect permanent 'do_not_retry' errors and bail out immediately
+                if _stderr_is_do_not_retry(cp.stderr):
+                    logging.warning(
+                        "Probe failed with do_not_retry error (rc=%s) with args %s :: %s",
+                        cp.returncode, " ".join(argset), tail)
+                    raise RuntimeError(f"do_not_retry probe error: {tail}")
+                logging.warning("Probe failed (rc=%s) with args %s :: %s",
+                                cp.returncode, " ".join(argset), tail)
+        if outer_try < max_outer:
+            logging.warning("Probe retry %d/%d …", outer_try, max_outer)
+            _sleep_with_countdown(options, options.probe_retry_cooldown_secs, step=1)
+
+    raise RuntimeError("yt-dlp -J failed after multi-client fallback attempts")
+
+
+def _available_sub_langs(info: dict) -> set[str]:
+    """Get set of all subtitle languages present in the video."""
+    keys = set()
+    for sec in ("subtitles", "automatic_captions"):
+        d = info.get(sec) or {}
+        keys.update(d.keys())
+    return keys
+
+
+def _available_human_sub_langs(info: dict) -> set[str]:
+    """Get set of languages that have human-made subtitles."""
+    return set((info.get("subtitles") or {}).keys())
+
+
+def _key_matches_base(k: str, base: str) -> bool:
+    """
+    Does a subtitle/audio language key `k` match a requested base?
+    Matches: exact 'en', regional 'en-US', and 'en-orig'.
+    """
+    return (k == base) or k.startswith(base + "-") or (k == f"{base}-orig")
+
+
+def _detect_original_sub_base(info: dict, allow_auto: bool) -> tuple[str | None, str | None]:
+    """
+    Return (base, source) where source is 'human' or 'auto'.
+    Respect --auto: if not allowed, only look under human-made subtitles.
+    """
+    # human first
+    human_keys = set((info.get("subtitles") or {}).keys())
+    for k in sorted(human_keys):
+        if k.endswith("-orig") and len(k) > 5:
+            return (k[:-5], "human")
+    if allow_auto:
+        auto_keys = set((info.get("automatic_captions") or {}).keys())
+        for k in sorted(auto_keys):
+            if k.endswith("-orig") and len(k) > 5:
+                return (k[:-5], "auto")
+    return (None, None)
+
+
+def _sub_keys_by_section(info: dict) -> tuple[set[str], set[str]]:
+    """Return (human_sub_keys, auto_sub_keys)."""
+    human = set((info.get("subtitles") or {}).keys())
+    auto  = set((info.get("automatic_captions") or {}).keys())
+    return human, auto
+
+
+def _is_translation_only_base(info: dict, base: str, allow_auto: bool) -> bool:
+    """
+    Return True if this base appears ONLY as auto-generated/translated subtitles,
+    not as human-made subs, and is not the original *-orig language.
+
+    This is what we treat as "noncritical" in non-strict mode: we will try,
+    but repeated 429s or failures won't abort the whole job.
+
+    Args:
+        info:       yt-dlp metadata dict.
+        base:       Language base to check (e.g., 'fr').
+        allow_auto: Whether automatic captions are allowed.
+    
+    Returns:
+        True if this base is translation-only, False otherwise.
+    """
+    human, auto  = _sub_keys_by_section(info)
+    orig_base, _ = _detect_original_sub_base(info, allow_auto)
+    has_human    = any(_key_matches_base(k, base) for k in human)
+    has_auto     = any(_key_matches_base(k, base) for k in auto)
+    # translation-only = present only under auto captions, AND not the original language
+    return has_auto and not has_human and (base != orig_base)
+
+
+def _matching_keys_for_base(keys: set[str], base: str) -> list[str]:
+    """All keys in `keys` that match the requested base (order-stable, sorted for determinism)."""
+    return sorted(k for k in keys if _key_matches_base(k, base))
+
+
+def _choose_exact_sub_keys(info: dict, requested_bases: list[str], allow_auto: bool) -> list[str]:
+    """
+    For each requested base, prefer human-made subtitle keys; only if none exist,
+    fall back to automatic caption keys (but only if allow_auto is True).
+    Preserve all variants (e.g., zh-Hans/Hant).
+    Then dedupe away '<base>-orig' if any non-orig exists for that base.
+    """
+    human, auto = _sub_keys_by_section(info)
+    chosen: list[str] = []
+    for b in requested_bases:
+        h = _matching_keys_for_base(human, b)
+        if h:
+            chosen.extend(h)
+        else:
+            if allow_auto:
+                chosen.extend(_matching_keys_for_base(auto, b))
+    # Keep variants but drop redundant '<base>-orig' when a non-orig also exists
+    return _dedupe_sub_keys_prefer_non_orig(chosen)
+
+
+def _detect_original_audio_base(info: dict) -> str | None:
+    """
+    Guess original audio base by taking the highest-abr audio-only format's language.
+    Fallback to highest-tbr progressive A/V if no audio-only has language.
+    """
+    formats = info.get("formats") or []
+
+    # audio-only with language
+    audio_only = [f for f in formats
+                  if (f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("language"))]
+    if audio_only:
+        best = max(audio_only, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
+        return (best["language"].split("-")[0]).strip()
+
+    # progressive with language (rare, but safe fallback)
+    prog = [f for f in formats
+            if (f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("language"))]
+    if prog:
+        best = max(prog, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+        return (best["language"].split("-")[0]).strip()
+
+    return None
+
+
+def _resolve_bases_for_subs(requested_bases: list[str], info: dict, allow_auto: bool) -> list[str]:
+    """
+    Expand requested bases for subtitles, honoring 'orig':
+      - If 'orig' is present and we can detect an original subtitle base (xx-orig),
+        replace 'orig' with that base unless that base is already requested.
+      - Drop 'orig' otherwise.
+      - Keep order from requested_bases.
+    """
+    orig_base, _ = _detect_original_sub_base(info, allow_auto)
+    resolved: list[str] = []
+    for b in requested_bases:
+        if b == "orig":
+            if orig_base:
+                base_already = any(x.split("-")[0] == orig_base for x in (resolved + requested_bases))
+                if not base_already:
+                    resolved.append(orig_base)
+            # else: skip, because orig is redundant or unknown
+        else:
+            if b not in resolved:
+                resolved.append(b)
+    return resolved
+
+
+def _resolve_bases_for_audio(requested_bases: list[str], info: dict) -> list[str]:
+    """
+    Expand requested bases for audio, honoring 'orig' via audio formats:
+      - If 'orig' is present and original audio base detected,
+        replace 'orig' with that base unless already requested.
+      - Drop 'orig' otherwise.
+      - Keep order from requested_bases.
+    """
+    orig_base = _detect_original_audio_base(info)
+    resolved: list[str] = []
+    for b in requested_bases:
+        if b == "orig":
+            if orig_base:
+                base_already = any(x.split("-")[0] == orig_base for x in (resolved + requested_bases))
+                if not base_already:
+                    resolved.append(orig_base)
+        else:
+            if b not in resolved:
+                resolved.append(b)
+    return resolved
+
+
+def _iso639_2(code: str) -> str:
+    """Map base code to ISO-639-2 (fallback to base)."""
+    base = code.split("-")[0]
+    return _ISO639_2.get(base, base)
+
+
+def _lang_title(code: str) -> str:
+    base = code.split("-")[0]
+    return _LANG_TITLES.get(base, base.upper())
+
+
+def _lang_names(bases: list[str]) -> str:
+    """Pretty-print language base list using _LANG_TITLES (e.g., ['en','fr'] -> 'English, French')."""
+    return ", ".join(_LANG_TITLES.get(b.split("-")[0], b.upper()) for b in bases)
+
+
+def _available_audio_bases(info: dict) -> set[str]:
+    """Set of base audio languages present (e.g., {'en','fr'})."""
+    bases = set()
+    for f in info.get("formats") or []:
+        lang = f.get("language")
+        if lang:
+            bases.add(lang.split("-")[0])
+    return bases
+
+
+def _sanitize_filename_component(s: str) -> str:
+    """Make a string safe for use in filenames by replacing problematic characters."""
+    s = s.replace("/", "_").replace("\\", "_")
+    return "".join(ch if ch.isprintable() else "_" for ch in s)
+
+
+def _title_base_from_metadata(options: Options,
+                              meta: dict,
+                              prefix: str | None = None) -> str:
+    """
+    Reconstruct the filename base from yt-dlp-like metadata using the same
+    keys as _get_title_base()'s JSON fallback: uploader, title, id.
+
+    Applies dynamic truncation to avoid filesystem path/component limits.
+    """
+    raw_u  = _sanitize_filename_component(((meta.get("uploader") or "").strip() or "NA"))
+    raw_t  = _sanitize_filename_component(( meta.get("title")    or "").strip()         )
+    raw_id = _sanitize_filename_component(( meta.get("id")       or "").strip()         )
+
+    return _safe_output_base(options, raw_t, raw_u, raw_id, prefix=prefix)
+
+
+def _get_title_base(options: Options, url: str,
+                    prefix: str | None = None,
+                    info:  dict | None = None) -> str:
+    """
+    Compute the output filename base (without extension) from metadata only,
+    using the same pattern as yt-dlp (uploader, title, id).
+    If prefix is provided (e.g., '003-'), it's prepended so subtitle/media checks
+    match the actual written files.
+    """
+    if info is None:
+        info = _probe_info(options, url)
+
+    logging.info("Probing title (fast) before subtitle attempts ...")
+    base = _title_base_from_metadata(options, info, prefix=prefix)
+    if not base:
+        raise RuntimeError("Could not determine title base from yt-dlp metadata")
+
+    logging.info("Title base: %s", base)
+    return base
+
+
+def _fs_units_len(s: str) -> int:
+    """
+    Filesystem length units:
+      - POSIX/macOS: bytes on disk (UTF-8-ish)
+      - Windows: UTF-16 path API is char-based for our practical purposes here
+    """
+    if os.name == "nt":
+        return len(s)
+    enc = sys.getfilesystemencoding() or "utf-8"
+    return len(s.encode(enc, errors="surrogateescape"))
+
+
+def _truncate_fs_units(text: str, max_units: int, *, ellipsis: str = "…") -> str:
+    """
+    Truncate string to fit in max filesystem units (bytes on POSIX, chars on Windows),
+    adding an ellipsis if truncated.
+    """
+    if max_units <= 0:
+        return ""
+    if _fs_units_len(text) <= max_units:
+        return text
+
+    ell_len = _fs_units_len(ellipsis)
+    if ell_len > max_units:
+        # Fallback: no room even for ellipsis
+        return ""
+
+    budget = max_units - ell_len
+    out_chars: list[str] = []
+    used = 0
+    for ch in text:
+        ch_len = _fs_units_len(ch)
+        if used + ch_len > budget:
+            break
+        out_chars.append(ch)
+        used += ch_len
+    return "".join(out_chars) + ellipsis
+
+
+def _truncate_middle_fs_units(text: str, max_units: int, *, ellipsis: str = "…") -> str:
+    """
+    Middle truncation that preserves both start and end.
+    Useful for non-default filename patterns where the ID is often near the end.
+    """
+    if max_units <= 0:
+        return ""
+    if _fs_units_len(text) <= max_units:
+        return text
+
+    ell_len = _fs_units_len(ellipsis)
+    if ell_len > max_units:
+        return ""
+
+    # Split remaining budget roughly 60/40 head/tail
+    remaining = max_units - ell_len
+    head_budget = int(remaining * 0.6)
+    tail_budget = remaining - head_budget
+
+    head = _truncate_fs_units(text, head_budget, ellipsis="")
+    # Tail truncation by walking from the end
+    tail_chars: list[str] = []
+    used = 0
+    for ch in reversed(text):
+        ch_len = _fs_units_len(ch)
+        if used + ch_len > tail_budget:
+            break
+        tail_chars.append(ch)
+        used += ch_len
+    tail = "".join(reversed(tail_chars))
+
+    return head + ellipsis + tail
+
+
+def _runtime_name_and_path_limits(output_dir: str | os.PathLike[str] = ".") -> tuple[int, int | None]:
+    """
+    Return (max_component_len, max_full_path_len_or_None) for the target directory.
+
+    - On POSIX/macOS, uses pathconf when available.
+    - On Windows, uses GetVolumeInformationW for component max and a conservative
+      full-path cap (259 usable chars) unless using a \\?\\ path prefix.
+    """
+    p = Path(output_dir).resolve()
+
+    # Sensible defaults
+    name_max = 255
+    path_max: int | None = None
+
+    if os.name == "nt":
+        # Component limit from Windows API (typically 255)
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            GetVolumePathNameW = ctypes.windll.kernel32.GetVolumePathNameW
+            GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+            GetVolumePathNameW.restype = wintypes.BOOL
+
+            GetVolumeInformationW = ctypes.windll.kernel32.GetVolumeInformationW
+            GetVolumeInformationW.argtypes = [
+                wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD
+            ]
+            GetVolumeInformationW.restype = wintypes.BOOL
+
+            vol_buf = ctypes.create_unicode_buffer(261)
+            if GetVolumePathNameW(str(p), vol_buf, len(vol_buf)):
+                max_comp = wintypes.DWORD()
+                fs_flags = wintypes.DWORD()
+                if GetVolumeInformationW(
+                    vol_buf.value, None, 0, None,
+                    ctypes.byref(max_comp), ctypes.byref(fs_flags),
+                    None, 0
+                ):
+                    if max_comp.value:
+                        name_max = int(max_comp.value)
+        except Exception:
+            pass
+
+        # Full path limit: conservative legacy MAX_PATH budget unless already using \\?\
+        path_str = str(p)
+        if path_str.startswith("\\\\?\\"):
+            path_max = 32767
+        else:
+            path_max = 259  # MAX_PATH(260) minus trailing NUL
+    else:
+        # POSIX/macOS
+        try:
+            nm = os.pathconf(os.fspath(p), "PC_NAME_MAX")
+            if isinstance(nm, int) and nm > 0:
+                name_max = nm
+        except Exception:
+            pass
+
+        try:
+            pm = os.pathconf(os.fspath(p), "PC_PATH_MAX")
+            # Some systems report very large values or -1 for indeterminate; only use sane positives.
+            if isinstance(pm, int) and pm > 0:
+                path_max = pm
+        except Exception:
+            path_max = None
+
+    return name_max, path_max
+
+
+def _output_suffix_budget(options: Options) -> int:
+    """
+    Reserve enough space for the longest suffix yt-dlp may append after the base name:
+    media ext, subtitle language tag, subtitle ext, and '.part'.
+
+    This protects both:
+      - video files:  <base>.mkv
+      - subtitle files: <base>.<lang>.srt
+    """
+    candidates = [
+        ".mkv",
+        ".mkv.part",
+        # yt-dlp fragment temp files can be much longer than the final filename:
+        #   <base>.mp4.part-Frag11.part
+        # Reserve for a large fragment index to avoid ENAMETOOLONG during download.
+        ".mp4.part-Frag999999.part",
+        ".webm.part-Frag999999.part",
+        ".m4a.part-Frag999999.part",
+        ".en.srt",
+        ".en.srt.part",
+        ".en-orig.srt.part",
+        ".zh-Hans.srt.part",
+        ".zh-Hant.srt.part",
+        ".pt-BR.srt.part",
+    ]
+    if options.args and getattr(options.args, "langs", None):
+        for lang in options.args.langs:
+            candidates.append(f".{lang}.srt")
+            candidates.append(f".{lang}.srt.part")
+    return max(_fs_units_len(s) for s in candidates)
+
+
+def _safe_output_base(options: Options,
+                      title: str,
+                      uploader: str,
+                      vid: str,
+                      prefix: str | None = None,
+                      output_dir: str | os.PathLike[str] = ".") -> str:
+    """
+    Build a filesystem-safe output base (no extension), preserving uploader and ID when possible.
+
+    For the default pattern '%(title)s - %(uploader)s - ID %(id)s', truncation is applied
+    primarily to the title and only trims uploader if necessary.
+    """
+    prefix_s = prefix or ""
+
+    # Start with the untruncated base (same semantics as before)
+    try:
+        raw_base = options.filename_pattern % {
+            "title": title,
+            "uploader": uploader,
+            "id": vid,
+        }
+    except Exception:
+        raw_base = f"{title} - {uploader} - ID {vid}"
+
+    raw_base = _sanitize_filename_component(raw_base).strip("_")
+    if prefix_s:
+        raw_base = f"{prefix_s}{raw_base}"
+
+    name_max, path_max = _runtime_name_and_path_limits(output_dir)
+    suffix_budget = _output_suffix_budget(options)
+
+    # Component-length budget (single filename component)
+    allowed_component = max(1, int(name_max) - suffix_budget)
+
+    # Full-path budget (cwd + '/' + filename + suffix)
+    parent_abs = str(Path(output_dir).resolve())
+    sep_units = 0 if parent_abs.endswith(os.sep) else _fs_units_len(os.sep)
+    if path_max is None:
+        allowed_by_path = allowed_component
+    else:
+        allowed_by_path = int(path_max) - _fs_units_len(parent_abs) - sep_units - suffix_budget
+        allowed_by_path = max(1, allowed_by_path)
+
+    allowed_base_units = min(allowed_component, allowed_by_path)
+
+    if _fs_units_len(raw_base) <= allowed_base_units:
+        return raw_base
+
+    default_pattern = "%(title)s - %(uploader)s - ID %(id)s"
+
+    # Smart truncation for your default pattern: preserve uploader + ID, trim title first.
+    if options.filename_pattern == default_pattern:
+        chunk_budget = allowed_base_units - _fs_units_len(prefix_s)
+        if chunk_budget < 1:
+            # Extremely deep path; nothing reasonable fits. Fall back to a hard truncation.
+            safe = _truncate_middle_fs_units(raw_base, allowed_base_units)
+            return safe or raw_base[:1]
+
+        # Keep ID always if humanly possible
+        tail_static = f" - ID {vid}"
+        # First try keeping full uploader and only trimming title
+        tail_with_uploader = f" - {uploader}{tail_static}"
+        title_budget = chunk_budget - _fs_units_len(tail_with_uploader)
+
+        # If title would become too tiny, shrink uploader a bit to preserve title usefulness
+        min_title_budget = 24
+        if title_budget < min_title_budget:
+            fixed_no_uploader = tail_static
+            # Budget for uploader after reserving a useful title
+            uploader_budget = chunk_budget - _fs_units_len(fixed_no_uploader) - max(1, min_title_budget)
+            # Keep uploader present, but allow truncation
+            if uploader_budget < 4:
+                uploader_budget = max(1, chunk_budget - _fs_units_len(tail_static) - 3)  # " - " + 1 char
+            uploader2 = _truncate_fs_units(uploader, max(1, uploader_budget))
+        else:
+            uploader2 = uploader
+
+        # Final title budget after possible uploader truncation
+        tail_final = f" - {uploader2} - ID {vid}"
+        title_budget_final = max(1, chunk_budget - _fs_units_len(tail_final))
+        title2 = _truncate_fs_units(title, title_budget_final)
+
+        safe_base = f"{prefix_s}{title2}{tail_final}"
+
+        # Final belt-and-suspenders check
+        if _fs_units_len(safe_base) > allowed_base_units:
+            safe_base = _truncate_middle_fs_units(safe_base, allowed_base_units)
+
+        logging.warning("Truncated filename base to avoid ENAMETOOLONG "
+                        "(limit=%d fs-units, dir=%s).",
+                        allowed_base_units, parent_abs)
+        return safe_base
+
+    # Generic fallback for custom patterns: middle-truncate the fully rendered base
+    safe_base = _truncate_middle_fs_units(raw_base, allowed_base_units)
+    if logging.getLogger().isEnabledFor(logging.INFO):
+        logging.warning(
+            "Truncated filename base (custom pattern) to avoid ENAMETOOLONG "
+            "(limit=%d fs-units, dir=%s).",
+            allowed_base_units, parent_abs
+        )
+    return safe_base or raw_base[:1]
+
+
+def _have_sub_key(title_base: str, sub_key: str, search_dir: str | os.PathLike[str] = ".") -> bool:
+    """
+    Check whether a subtitle file with a specific key exists on disk.
+    """
+    root = Path(search_dir)
+    for ext in ("srt", "vtt", "ass"):
+        if (root / f"{title_base}.{sub_key}.{ext}").exists():
+            return True
+    return False
+
+
+def _have_lang(title_base: str, lang: str, search_dir: str | os.PathLike[str] = ".") -> bool:
+    """
+    Check whether a subtitle file for a given language exists on disk.
+    Accept .srt (preferred), but also .vtt/.ass if conversion didn't happen.
+    """
+    root = Path(search_dir)
+
+    # Direct exact checks (no wildcards) don't need escaping:
+    for ext in ("srt", "vtt", "ass"):
+        if (root / f"{title_base}.{lang}.{ext}").exists():
+            return True
+
+    # Variant like "<base>-US" needs a wildcard, so ESCAPE the title part:
+    safe_title = glob.escape(title_base)
+    for ext in ("srt", "vtt", "ass"):
+        pattern = f"{safe_title}.{lang}-*.{ext}"
+        # Use glob.glob on the directory; returns strings -> wrap in any to short-circuit
+        if any(root.glob(pattern)):
+            return True
+
+    return False
+
+
+def _have_media_for_title_base(title_base: str,
+                               search_dir: str | os.PathLike[str] = ".") -> bool:
+    """
+    Check whether a final media file already exists for the given title base
+    (i.e. the part before the extension).
+
+    We primarily look for MKV (since we use --merge-output-format mkv), but
+    also consider a few other common containers.
+    """
+    if not title_base:
+        return False
+
+    root       = Path(search_dir)
+    safe_title = glob.escape(title_base)
+
+    for ext in ("mkv", "mp4", "webm", "m4v", "mov"):
+        pattern = f"{safe_title}.{ext}"
+        if any(root.glob(pattern)):
+            return True
+
+    return False
+
+
+def _find_media_by_video_id(vid: str,
+                            search_dir: str | os.PathLike[str] = ".") -> Path | None:
+    """
+    Search for an existing media file whose name contains '- ID <vid>',
+    tolerating user annotations or renames after the ID portion.
+
+    A regex word-boundary check prevents substring false positives
+    (e.g. ID 'abc' must not match a file with 'ID abcdef').
+
+    Returns the Path of the first match, or None.
+    """
+    if not vid:
+        return None
+
+    root     = Path(search_dir)
+    safe_vid = glob.escape(vid)
+    # ID must NOT be followed by another ID-legal character (alnum, dash, underscore)
+    id_re    = re.compile(r"- ID " + re.escape(vid) + r"(?![A-Za-z0-9_-])")
+
+    for ext in ("mkv", "mp4", "webm", "m4v", "mov"):
+        for hit in root.glob(f"*- ID {safe_vid}*.{ext}"):
+            if id_re.search(hit.stem):
+                return hit
+    return None
+
+
+def _symlink_media_alias(title_base: str, existing: Path) -> None:
+    """
+    Create a same-directory relative symlink from the expected canonical
+    filename (title_base + ext) to the existing (renamed/annotated) media
+    file, so future exact-match checks succeed on the fast path.
+    """
+    link_path = existing.parent / f"{title_base}{existing.suffix}"
+    if link_path.exists() or link_path.is_symlink():
+        return
+    try:
+        link_path.symlink_to(existing.name)
+        logging.info("Created symlink: %s -> %s", link_path.name, existing.name)
+    except OSError as e:
+        logging.warning("Could not create symlink %s -> %s: %s",
+                        link_path.name, existing.name, e)
+
+
+def _entry_url(entry: dict) -> str:
+    """
+    Best-effort URL for a playlist entry. Prefer webpage_url if present, else url.
+
+    Args:
+        entry: Playlist entry dictionary.
+    
+    Returns:
+        The best-effort URL for the playlist entry.
+    """
+    return entry.get("webpage_url") or entry.get("url") or ""
+
+
+def _process_single(options: Options, url: str, extra: list[str], *,
+                    prefix: str | None = None,
+                    info:  dict | None = None) -> int:
+    """
+    Run the two-pass flow for a single video URL.
+    If prefix is provided (e.g., '003-'), it overrides -o for both passes so the
+    title base and written files are consistently prefixed.
+
+    Args:
+        options:    Options object.
+        url:        Video URL.
+        extra:      Extra args to pass to yt-dlp (rarely needed).
+        prefix:     Optional prefix to prepend to the title base.
+        info:       Optional pre-fetched metadata dictionary to avoid re-probing.
+
+    Returns:
+        0 on success, non-zero on failure.
+
+    Raises:
+        RuntimeError: On fatal errors in subtitle pass.
+    """
+    if info is None:
+        try:
+            info = _probe_info(options, url)
+        except Exception as e:
+            logging.error("Metadata probe failed for %s: %s", url, e)
+            return 4  # non-zero rc so playlist code can log+continue
+
+    # Canonical title base from yt-dlp (matches what the downloader will use)
+    title_base = _get_title_base(options, url, prefix=prefix, info=info)
+
+    # If we're not in --onlysubs mode and the media file already exists,
+    # skip this item entirely (resume-friendly for both playlists and single URLs).
+    skip_for_media = not (options.args and getattr(options.args, "onlysubs", False))
+    if skip_for_media and _have_media_for_title_base(title_base):
+        logging.info("Media file already present for %s; skipping item.",
+                     title_base)
+        return 0
+
+    # Fallback: match any media file by video ID alone
+    # (covers renamed / annotated files).
+    if skip_for_media:
+        vid    = _sanitize_filename_component((info.get("id") or "").strip())
+        id_hit = _find_media_by_video_id(vid) if vid else None
+        if id_hit:
+            logging.info("Found existing media by video ID %s: %s "
+                         "(filename was modified since download).",
+                         vid, id_hit.name)
+            _symlink_media_alias(title_base, id_hit)
+            return 0
+
+    # Per-call output override: force yt-dlp to use the already-computed safe base
+    # (prevents ENAMETOOLONG during the actual download pass).
+    out_override = ["-o", f"{title_base}.%(ext)s"]
+
+    logging.info("=== Item start%s ===", f" [{prefix.removesuffix(' - ')}]" if prefix else "")
+    did_sub_attempts = False
+    if not options.args.nosubs:
+        try:
+            did_sub_attempts = _subs_pass(options, url, extra + out_override,
+                                          prefix=prefix, info=info, title_base=title_base)
+            if options.args.onlysubs:
+                logging.info("Only subs mode: finished subtitles; skipping media pass.")
+                logging.info("=== Item done (subtitles only)%s ===",
+                             f" [{prefix.removesuffix(' - ')}]" if prefix else "")
+                return 0
+        except Exception as e:
+            logging.error("%s", e)
+            return 3
+        if did_sub_attempts:
+            logging.info("Cooling down %d seconds before media pass ...",
+                         options.args.cooldown_between_passes)
+            _sleep_with_countdown(options, options.args.cooldown_between_passes)
+        else:
+            logging.info("No subtitle downloads were attempted for this item; "
+                         "skipping cooldown between passes.")
+    else:
+        logging.info("Skipping subtitles pass as per --nosubs.")
+
+    rc = _media_pass(options, url, extra + out_override, info=info)
+    if rc != 0:
+        return rc
+
+    logging.info("=== Item done%s ===", f" [{prefix.removesuffix(' - ')}]" if prefix else "")
+    return 0
+
+
+def _sub_key_base(key: str) -> str:
+    """Return base language for a subtitle key ('en', 'en-US', 'en-orig' -> 'en')."""
+    return key.split("-")[0]
+
+
+def _dedupe_sub_keys_prefer_non_orig(keys: list[str]) -> list[str]:
+    """
+    Keep all non-orig variants (including region/script), and only drop '<base>-orig'
+    if there is at least one non-orig key with the same base.
+    Preserve input order.
+    """
+    base_to_has_non_orig: dict[str, bool] = {}
+    for k in keys:
+        b = _sub_key_base(k)
+        if not k.endswith("-orig"):
+            base_to_has_non_orig[b] = True
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in keys:
+        if k in seen:
+            continue
+        b = _sub_key_base(k)
+        if k.endswith("-orig") and base_to_has_non_orig.get(b, False):
+            # Skip orig because a non-orig exists for this base
+            continue
+        out.append(k)
+        seen.add(k)
+    return out
+
+
+def _pretty_sub_label(key: str) -> str:
+    """
+    Human label for a subtitle key like 'en', 'en-orig', 'zh-Hans', 'zh-Hant', 'pt-BR', etc.
+    """
+    base      = key.split("-")[0]
+    rest      = key[len(base):].lstrip("-")
+    base_name = _LANG_TITLES.get(base, base.upper())
+
+    # Special-cases we care about
+    if key.endswith("-orig"):
+        return f"{base_name} (Original)"
+    if key.startswith("zh-"):
+        if rest.lower() == "hans":
+            return "Chinese (Simplified)"
+        if rest.lower() == "hant":
+            return "Chinese (Traditional)"
+        # fallback: show the variant
+        return f"{base_name} ({rest})" if rest else base_name
+
+    # Generic regional variant 'pt-BR' -> 'Portuguese (BR)'
+    if rest:
+        return f"{base_name} ({rest})"
+    return base_name
+
+
+def _stderr_has_429(s: str | None) -> bool:
+    """Check if stderr output indicates a 429 error."""
+    return bool(s) and "HTTP Error 429" in s
+
+
+def _stderr_is_do_not_retry(s: str | None) -> bool:
+    """
+    Return True if stderr indicates a permanent error where retrying will not help.
+    This defines the 'do_not_retry' error group.
+    """
+    if not s:
+        return False
+
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+
+    # Only consider actual ERROR lines for permanence
+    err_lines = [ln.lower() for ln in lines if ln.lower().startswith("error:")]
+
+    keywords = [
+        # HTTP / generic
+        "http error 403",                 # forbidden / geo / permission
+        "http error 404",                 # not found
+        "geo restriction",                # “geo restriction” text
+        "geo-restriction",                # variant
+        "not available from your location",
+        "unsupported url",                # generic Unsupported URL messages
+
+        # YouTube-style permanent unavailability
+        "video unavailable",
+        "this video is no longer available because the youtube account associated with this video has been terminated",
+        "this video is private",
+        "this video is only available to youtube premium members",
+        "this video is not available",    # generic fallback
+    ]
+    return any(any(k in ln for k in keywords) for ln in err_lines)
+
+def _strict_sleep_seconds(options: Options, tries: int) -> int:
+    """
+    Compute strict-mode sleep for the given try number (1-based), including
+    exponential backoff and clamping to strict_max_sleep.
+
+    Args:
+        options: Options object containing:
+            - strict_base_cooldown: Base cooldown in seconds.
+            - strict_max_sleep:     Maximum sleep in seconds.
+            - strict_exp_base:      Exponential backoff base.
+        tries:   Current try number (1-based).
+
+    Returns:
+        Sleep time in seconds.
+    """
+    factor = options.strict_exp_base ** max(tries - 1, 0)
+    return min(options.strict_base_cooldown * factor, options.strict_max_sleep)
+
+
+def _strict_effective_max_tries(options: Options) -> int:
+    """
+    Compute an effective per-language max_tries for strict mode, such that we only
+    ever hit the strict_max_sleep cap once.
+
+    The idea:
+      - Let t_cap be the first try index whose backoff would be clamped
+        (strict_base_cooldown * strict_exp_base^(t_cap-1) >= strict_max_sleep).
+      - Allow one more try after that (t_cap+1) so we get:
+          * a final attempt after the first strict_max_sleep wait.
+      - Effective max_tries = min(user_max_tries, t_cap+1).
+    """
+    user_max  = int(getattr(options.args, "max_tries", 1) or 1)
+
+    # Safety guard: options.strict_exp_base must be > 1 to avoid infinite loop
+    if options.strict_exp_base <= 1:
+        return user_max
+
+    t = 1
+    while True:
+        factor = options.strict_exp_base ** max(t - 1, 0)
+        if options.strict_base_cooldown * factor >= options.strict_max_sleep:
+            cap_based = t + 1
+            eff = min(user_max, cap_based)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    "Strict mode: capping per-language tries at %d (user max=%d, first clamp at try=%d)",
+                    eff, user_max, t,
+                )
+            return eff
+        t += 1
+
+
+def _subs_pass(options: Options, url: str, extra_args: Iterable[str], *,
+               prefix:     str | None = None,
+               info:      dict | None = None,
+               title_base: str | None = None) -> bool:
+    """
+    Run the subtitles-only pass with retries until specified languages are present.
+    Requests one language at a time.
+    Applies a larger cooldown if YouTube responds with HTTP 429.
+
+    Args:
+        options:    Options object containing:
+            - args.cooldown_between_tries: Seconds to wait between tries.
+            - args.max_tries:              Maximum tries before failing hard.
+        url:        Video URL.
+        extra_args: Extra args to pass to yt-dlp (rarely needed).
+        prefix:     Optional prefix to prepend to the title base.
+        info:       Optional pre-fetched metadata dictionary to avoid re-probing.
+        title_base: Optional pre-fetched title base to avoid re-probing.
+
+    Returns:
+        True  if we actually attempted any subtitle downloads (i.e. called yt-dlp),
+        False if we skipped the sub pass entirely (e.g. no requested languages present).
+
+    Raises:
+        RuntimeError: If required subtitles are still missing after max_tries.
+    """
+    if info is None:
+        info = _probe_info(options, url)
+    if title_base is None:
+        title_base = _get_title_base(options, url, prefix=prefix, info=info)
+    allow_auto:      bool = bool(getattr(options.args, "auto", False))
+    avail_any:   set[str] = _available_sub_langs(info)
+    avail_human: set[str] = _available_human_sub_langs(info)
+
+    if getattr(options.args, "strict", False):
+        effective_max_tries = _strict_effective_max_tries(options)
+        logging.info("Strict mode: per-language max tries = %d (user requested %d).",
+                     effective_max_tries, options.args.max_tries)
+    else:
+        effective_max_tries = int(options.args.max_tries)
+
+    # Track whether we actually ran yt-dlp for any subtitle language
+    had_any_attempt = False
+
+    # Log what "orig" means (or doesn't) for subtitles
+    if "orig" in options.args.langs:
+        orig_sub_base, orig_src = _detect_original_sub_base(info, allow_auto)
+        if orig_sub_base:
+            src_note = " (human-made)" if orig_src == "human" else " (auto captions)"
+            logging.info("Detected original subtitle language: %s%s",
+                         _LANG_TITLES.get(orig_sub_base, orig_sub_base.upper()), src_note)
+        else:
+            logging.info("No original subtitle language detected in allowed sources (no '*-orig' key).")
+
+    # Resolve requested bases (handles 'orig' intelligently)
+    resolved_bases = _resolve_bases_for_subs(options.args.langs, info, allow_auto)
+
+    # Keep bases that have *human subs* unless --auto is set (then human OR auto)
+    pool           = avail_any if allow_auto else avail_human
+    wanted_present = [b for b in resolved_bases if any(_key_matches_base(k, b) for k in pool)]
+    not_avail_subs = [b for b in resolved_bases if b not in wanted_present]
+    if not_avail_subs:
+        mode = "human-made" if not allow_auto else "human/auto"
+        logging.info("Video lacks requested subtitle languages (%s): %s", mode, _lang_names(not_avail_subs))
+    if not wanted_present:
+        logging.info("No requested subtitle languages present on this video; skipping subtitles pass.")
+        return False  # <<< no cooldown needed
+
+    # Work one base at a time to reduce YouTube rate-limiting on auto/translated tracks
+    failures_hard: list[str] = []  # truly required subs (orig or human-made, or strict mode)
+    failures_soft: list[str] = []  # translation-only subs skipped after repeated failures
+    for base in wanted_present:
+        # Prefer human; only fall back to auto if --auto was supplied
+        attempt_keys = _choose_exact_sub_keys(info, [base], allow_auto)
+        if not attempt_keys:
+            logging.info("No subtitle keys to request for base %s; skipping.", base)
+            continue
+
+        # Skip if all exact requested keys are already on disk
+        if all(_have_sub_key(title_base, k) for k in attempt_keys):
+            logging.info("Already have subtitles for %s; skipping.", _LANG_TITLES.get(base, base.upper()))
+            continue
+
+        logging.info("Requesting %s subtitles with keys: %s",
+                     _LANG_TITLES.get(base, base.upper()), ",".join(attempt_keys))
+
+        tries = 0
+        while True:
+            tries += 1
+            had_any_attempt = True  # <<< we are actually hitting yt-dlp for subs now
+            if getattr(options.args, "po_token", None):
+                if logging.getLogger().isEnabledFor(logging.DEBUG): logging.debug("Using PO token during subtitles pass (client+token supplied).")
+            cp = _ytdlp(*(_base_args(options, fast=False)),
+                        *(_subs_args(options, ",".join(attempt_keys))),
+                        url, *extra_args)
+            if cp.stderr:
+                if logging.getLogger().isEnabledFor(logging.DEBUG): logging.debug("subs(stderr): %s", cp.stderr.strip())
+
+            # Check disk for this base (any ext, any variant)
+            got_all = all(_have_sub_key(title_base, k) for k in attempt_keys)
+            if got_all:
+                logging.info("Acquired subtitles for %s (yt-dlp rc=%d).",
+                            _LANG_TITLES.get(base, base.upper()), cp.returncode)
+                break  # move to next base anyway since we got the subs, even if yt-dlp had a non-zero rc
+
+            if tries >= effective_max_tries:
+                logging.warning("Giving up on %s after %d tries.", base, tries)
+                # Determine if this base is "translation-only" (auto subs only, no human subs)
+                trans_only = _is_translation_only_base(info, base, allow_auto)
+                if trans_only and not getattr(options.args, "strict", False):
+                    # Default behaviour: translation-only subs are best-effort.
+                    logging.warning("Base %s appears to be auto-translation only; "
+                                    "skipping after repeated failures.",
+                                    _LANG_TITLES.get(base, base.upper()))
+                    failures_soft.append(base)
+                else:
+                    # Either it's a critical language (original/human-made) OR we're in strict mode,
+                    # so treat it as a hard failure.
+                    failures_hard.append(base)
+                break
+
+            # Backoff: longer sleep if 429; otherwise normal cooldown
+            if _stderr_has_429(cp.stderr):
+                if getattr(options.args, "strict", False):
+                    # STRICT MODE: use shared helper for exponential backoff + max_sleep cap.
+                    sleep_s = _strict_sleep_seconds(options, tries)
+                    logging.warning("Hit HTTP 429 while fetching %s (strict mode); "
+                                    "backing off %ds before retrying ...",
+                                    _LANG_TITLES.get(base, base.upper()), sleep_s)
+                else:
+                    # DEFAULT MODE: moderate backoff to avoid hammering, but not wild.
+                    sleep_s = max(
+                        int(options.args.cooldown_between_tries) * options.non_strict_429_factor,
+                        options.non_strict_429_min_sleep,
+                    )
+                    logging.warning("Hit HTTP 429 while fetching %s; backing off %ds before retrying ...",
+                                    _LANG_TITLES.get(base, base.upper()), sleep_s)
+            else:
+                sleep_s = int(options.args.cooldown_between_tries)
+
+            _sleep_with_countdown(options, sleep_s)
+
+    if failures_hard:
+        # Hard failure: original language or human-made subs (or strict mode) missing.
+        raise RuntimeError("Missing required subtitles after retries: "
+                           + ", ".join(failures_hard))
+
+    if failures_soft:
+        # Soft failure: translation-only subs we decided to skip.
+        logging.warning("Some auto-translated subtitles could not be downloaded and were skipped: %s",
+                        _lang_names(failures_soft))
+
+    logging.info("All required subtitles acquired.")
+    return had_any_attempt
+
+
+def _formats_with_urls(info: dict) -> list[dict]:
+    """Get list of formats that have a URL."""
+    return [f for f in (info.get("formats") or []) if f.get("url")]
+
+
+def _is_mp4_low_only_video(formats: list[dict]) -> bool:
+    """
+    Return True if the only downloadable video format(s) exposed are mp4-low.
+    We inspect formats that already have URLs (caller typically passes _formats_with_urls()).
+    """
+    video_ids = {
+        str(f.get("format_id") or "")
+        for f in formats
+        if f.get("vcodec") != "none"
+    }
+    return bool(video_ids) and video_ids == {"mp4-low"}
+
+
+def _pick_best_video(formats: list[dict],
+                     target_height: int | None = None,
+                     smallest: bool = False) -> dict | None:
+    """
+    Pick a video format (video+audio or video-only).
+
+    Default behaviour:
+      - Prefer video-only formats; fall back to best progressive.
+      - “Best” means highest height, then highest tbr.
+
+    With target_height set (e.g. 720 for --720p):
+      - Prefer the highest format <= target_height if any exist.
+      - Otherwise, pick the lowest format > target_height.
+      - Still prefers video-only over progressive.
+
+    With smallest=True (--smallest):
+      - Prefer the lowest height; ties broken by lowest tbr.
+      - Still prefers video-only over progressive.
+    
+    Args:
+        formats:        List of format dictionaries.
+        target_height:  Target height to aim for (e.g., 720 for --720p).
+        smallest:       Whether to pick the smallest format instead of the best.
+    
+    Returns:
+        The chosen format dictionary, or None if no video formats are available.
+    """
+    cand_vonly = [f for f in formats
+                  if f.get("vcodec") != "none" and f.get("acodec") == "none"]
+    cand_prog  = [f for f in formats
+                  if f.get("vcodec") != "none" and f.get("acodec") != "none"]
+
+    def pick(candidates: list[dict]) -> dict | None:
+        """Pick from the given candidate formats according to the specified criteria."""
+        if not candidates:
+            return None
+        # --smallest: minimum height, then minimum tbr
+        if smallest:
+            def smallest_key(f: dict) -> tuple[int, float]:
+                h = f.get("height")
+                if h is None:
+                    h = 10**9
+                t = f.get("tbr") or 10**9
+                return (h, t)
+            return min(candidates, key=smallest_key)
+        # --720p (or any target_height)
+        if target_height is not None:
+            with_height = [f for f in candidates if f.get("height") is not None]
+            # Prefer the best <= target
+            under = [f for f in with_height if f.get("height") <= target_height]
+            if under:
+                return max(under, key=lambda f: (f.get("height") or 0,
+                                                 f.get("tbr") or 0))
+            # Otherwise pick the smallest > target
+            if with_height:
+                return min(with_height, key=lambda f: (f.get("height") or 10**9,
+                                                       f.get("tbr") or 10**9))
+            # Fallback if no heights at all
+            return max(candidates, key=lambda f: (f.get("height") or 0,
+                                                  f.get("tbr") or 0))
+        # Default "best" behaviour
+        return max(candidates, key=lambda f: (f.get("height") or 0,
+                                              f.get("tbr") or 0))
+
+    v = pick(cand_vonly)
+    if v:
+        return v
+    return pick(cand_prog)
+
+
+def _pick_best_audio_for_base(formats: list[dict], base: str) -> dict | None:
+    """Pick the best audio format available for a given language base."""
+
+    def matches(lang: str | None) -> bool:
+        """Check if a language code matches the requested base."""
+        return bool(lang) and (lang == base or lang.startswith(base + "-"))
+
+    cand = [f for f in formats
+            if f.get("vcodec") == "none" and f.get("acodec") != "none" and matches(f.get("language"))]
+    return max(cand, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0)) if cand else None
+
+
+def _media_blind_client_overrides() -> list[list[str]]:
+    """
+    Base list of blind client overrides for media downloads, optionally
+    reordered so that _PREFERRED_YT_CLIENT is tried first.
+    """
+    base: list[list[str]] = [
+        # Most reliable first (default order):
+        ["--extractor-args", "youtube:player_client=tv_html5_embed"],
+        ["--extractor-args", "youtube:player_client=tv_embedded"],
+        ["--extractor-args", "youtube:player_client=web",  "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=mweb", "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=android", "--no-cookies"],
+        ["--extractor-args", "youtube:player_client=ios",     "--no-cookies"],
+    ]
+    preferred = _PREFERRED_YT_CLIENT
+    if not preferred:
+        return base
+
+    preferred_list: list[list[str]] = []
+    others:         list[list[str]] = []
+    for a in base:
+        (preferred_list if _client_name_for_argset(a) == preferred else others).append(a)
+
+    if preferred_list:
+        return preferred_list + others
+    return base
+
+
+def _media_pass(options: Options, url: str,
+                extra_args: Iterable[str],
+                info: dict | None = None) -> int:
+    """
+    Run the media pass with a dynamic -f (based on requested languages present) and dynamic --ppa.
+
+    Args:
+        options:    Options object.
+        url:        Video URL.
+        extra_args: Extra args to pass to yt-dlp.
+        info:       Optional pre-fetched metadata dictionary to avoid re-probing.
+
+    Returns:
+        0 on success, non-zero on failure.
+    """
+    global _PREFERRED_YT_CLIENT
+    if info is None:
+        info = _probe_info(options, url)
+    allow_auto: bool = bool(getattr(options.args, "auto", False))
+    attempt:     int = 0
+    last_rc:     int = 1
+
+    while True:
+        attempt += 1
+        logging.info("Media attempt #%d ...", attempt)
+
+        fmts = _formats_with_urls(info)
+
+        # If the site is only exposing mp4-low right now, treat that as a transient
+        # error unless the user explicitly opted in with --go-low.
+        if _is_mp4_low_only_video(fmts):
+            if getattr(options.args, "go_low", False):
+                logging.warning("Only mp4-low is available; proceeding because --go-low was set.")
+            else:
+                last_rc = 95  # custom non-zero code for mp4-low-only refusal
+
+                if attempt >= options.args.max_tries:
+                    logging.error("Only mp4-low is available and --go-low was not set. "
+                                  "Failing after %d attempts.", attempt)
+                    break
+
+                # Reuse the same 'long cooldown' policy as non-strict 429 handling
+                sleep_s = max(
+                    int(options.args.cooldown_between_tries) * options.non_strict_429_factor,
+                    options.non_strict_429_min_sleep,
+                )
+                logging.warning("Only mp4-low is available and --go-low was not set; "
+                                "backing off %ds before retrying media probe ...", sleep_s)
+
+                _sleep_with_countdown(options, sleep_s)
+
+                # Re-probe so the next attempt can see newly available HLS/other formats
+                try:
+                    info = _probe_info(options, url)
+                except Exception as e:
+                    logging.warning("Re-probe after mp4-low-only availability failed: %s", e)
+
+                continue
+
+        # Resolution preferences from CLI
+        target_height: int | None = None
+        prefer_smallest:     bool = False
+        if   getattr(options.args, "prefer_720p",     False):
+            target_height = 720
+        elif getattr(options.args, "prefer_smallest", False):
+            prefer_smallest = True
+
+        v = _pick_best_video(fmts, target_height=target_height,
+                             smallest=prefer_smallest)
+
+        # Log what "orig" means (or doesn't) for audio
+        if "orig" in options.args.langs:
+            orig_audio_base = _detect_original_audio_base(info)
+            if orig_audio_base:
+                logging.info("Detected original audio language: %s",
+                             _LANG_TITLES.get(orig_audio_base, orig_audio_base.upper()))
+            else:
+                logging.info("No original audio language detected from formats.")
+            orig_sub_base, _ = _detect_original_sub_base(info, allow_auto)
+            if orig_audio_base and orig_sub_base and orig_audio_base != orig_sub_base:
+                logging.info("Note: original audio looks %s but original subtitles look %s",
+                             _LANG_TITLES.get(orig_audio_base, orig_audio_base.upper()),
+                             _LANG_TITLES.get(  orig_sub_base,   orig_sub_base.upper()))
+
+        if not v:
+            logging.warning("No downloadable formats found via probe; attempting blind download(s) with alternate clients …")
+            client_overrides = _media_blind_client_overrides()
+            for override in client_overrides:
+                client_name = _client_name_for_argset(override)
+                logging.info("Blind attempt using client: %s", client_name)
+                blind_args = [*_base_args(options, fast=False),
+                              *_media_args(options),
+                              *override, url, *extra_args]
+                rc_blind = _ytdlp_streaming(*blind_args)
+                if rc_blind == 0:
+                    # Remember this client as preferred for the rest of the run
+                    _PREFERRED_YT_CLIENT = client_name
+                    return 0
+
+                logging.warning("Blind attempt with %s failed (rc=%d); trying next client …",
+                                client_name, rc_blind)
+
+                # After a failed blind attempt, run a quick list-formats with this
+                # client in capture mode so we can detect permanent errors and
+                # avoid hammering obviously-dead videos.
+                try:
+                    cp_list = _ytdlp(*(_base_args(options, fast=True)),
+                                     "--list-formats", *override, url)
+                except Exception as e:
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug("list-formats with %s failed: %s", client_name, e)
+                else:
+                    # Echo the formats / error table to the terminal so behavior
+                    # stays similar to the previous streaming call.
+                    if cp_list.stdout:
+                        sys.stderr.write(cp_list.stdout)
+                        sys.stderr.flush()
+
+                    if cp_list.stderr:
+                        lines = (cp_list.stderr or "").strip().splitlines()
+                        tail  = " | ".join(lines[-3:]) if lines else "<no stderr>"
+                        if logging.getLogger().isEnabledFor(logging.DEBUG):
+                            logging.debug("list-formats(stderr) with %s: %s", client_name, tail)
+                        if _stderr_is_do_not_retry(cp_list.stderr):
+                            logging.error("Media for this item appears permanently unavailable (do_not_retry): %s",
+                                          tail)
+                            last_rc = rc_blind or cp_list.returncode
+                            return last_rc
+
+            # If we get here, all blind attempts exhausted without a hard
+            # do_not_retry error being detected.
+            last_rc = rc_blind
+            logging.error("All blind attempts failed.")
+            logging.error("Media for this item appears to be unavailable or has no downloadable formats. "
+                          "Common causes: private video, removed video, terminated channel, or region lock.")
+            # Optional: final list-formats with a simple web client for visibility
+            try:
+                _ytdlp_streaming(*(_base_args(options, fast=True)), "--list-formats",
+                                 "--extractor-args", "youtube:player_client=web", url)
+            except Exception as e:
+                logging.error("Also failed to list formats: %s", e)
+            break
+
+        # Resolve requested bases for audio (handles 'orig')
+        resolved_audio_bases = _resolve_bases_for_audio(options.args.langs, info)
+
+        # Report which requested audio bases are not available at all
+        audio_avail_bases = _available_audio_bases(info)
+        not_avail_audio   = [b for b in resolved_audio_bases if b not in audio_avail_bases]
+        if not_avail_audio:
+            logging.info("Video lacks requested audio languages: %s", _lang_names(not_avail_audio))
+
+        seen_audio_ids: set[str] = set()
+        audio_ids:     list[str] = []
+        present_bases: list[str] = []
+
+        for base in resolved_audio_bases:
+            a = _pick_best_audio_for_base(fmts, base)
+            if not a:
+                continue
+            fmt_id = str(a["format_id"])
+            if fmt_id in seen_audio_ids:
+                continue
+            seen_audio_ids.add(fmt_id)
+            audio_ids.append(fmt_id)
+            present_bases.append(base)
+        if present_bases:
+            logging.info("Will mux audio tracks for: %s", _lang_names(present_bases))
+        else:
+            logging.info("No per-language audio tracks will be muxed.")
+
+        if audio_ids and v.get("acodec") == "none":
+            fmt = "+".join([str(v["format_id"])] + audio_ids)
+        elif v.get("acodec") != "none":
+            logging.warning("Only progressive A/V available; proceeding with single-track video format_id=%s",
+                            v["format_id"])
+            fmt = str(v["format_id"])
+        else:
+            logging.warning("No per-language audio with URLs; falling back to best single-file format")
+            fmt = "b"
+
+        # language/title tagging
+        ppa_parts = []
+
+        if present_bases:
+            # multi-audio case (already works)
+            for idx, base in enumerate(present_bases):
+                ppa_parts.append(f"-metadata:s:a:{idx} language={_iso639_2(base)}")
+                ppa_parts.append(f"-metadata:s:a:{idx} title={shlex.quote(_lang_title(base))}")
+        else:
+            # Progressive A/V: try to label the single audio track too
+            guess = _detect_original_audio_base(info) or (v.get("language") or "").split("-")[0] or None
+            if guess:
+                ppa_parts.append(f"-metadata:s:a:0 language={_iso639_2(guess)}")
+                ppa_parts.append(f"-metadata:s:a:0 title={shlex.quote(_lang_title(guess))}")
+
+        ppa_arg = " ".join(ppa_parts)
+
+        logging.info("Starting media pass with -f %s (yt-dlp will print its own progress) ...", fmt)
+        args = [*_base_args(options, fast=False), *_media_args(options), "-f", fmt]
+        if ppa_arg:
+            args += ["--ppa", f"Merger+ffmpeg:{ppa_arg}"]
+        args += [url, *extra_args]
+
+        rc = _ytdlp_streaming(*args)
+        if rc == 0:
+            return 0
+
+        last_rc = rc
+        # Negative rc means killed by signal; turn it into a readable note.
+        if rc < 0:
+            logging.warning("yt-dlp was terminated by signal %d; will retry after cooldown", -rc)
+        else:
+            logging.warning("yt-dlp exited with rc=%d; will retry after cooldown", rc)
+
+        if attempt >= options.args.max_tries:
+            logging.error("Media failed after %d attempts; last rc=%d", attempt, last_rc)
+            break
+
+        _sleep_with_countdown(options, options.args.cooldown_between_tries)
+
+    return last_rc
+
+
+if __name__ == "__main__":
+    try:
+        try:
+            main()
+        except KeyboardInterrupt:
+            # Clean, user-initiated cancel (Ctrl+C or q/Q/n/N/Esc)
+            logging.warning("yt2pass cancelled by user.")
+            logging.shutdown()
+            # Raise SystemExit so outer finally still runs
+            raise SystemExit(130)
+    finally:
+        # For safety: restore TTY state on exit in case of any uncaught exceptions or signals, to avoid leaving the terminal in a broken state. 
+        _restore_stdin_termios()

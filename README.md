@@ -1,6 +1,17 @@
 # yt2pass
 
-`yt-dlp` will silently produce a video file with no subtitles when YouTube rate-limits the subtitle download — you won't get an error, you'll just get a video without subs. `yt2pass` fixes that by doing subtitles first (with patient retries and configurable cooldowns) and only downloading the media once all required subtitle files exist on disk.
+A `yt-dlp` wrapper that picks the right flags, retries on transient failures, and mixes multi-language audio into one file.
+
+- **Multi-language audio in one file** — `--langs en,fr,ja` produces one MKV with three audio tracks, each tagged with its language.
+- **Automatic format selection** — prefers video-only formats so per-language audio can be muxed; `--720p` / `--smallest` shortcuts; gracefully refuses `mp4-low`-only states unless `--go-low`.
+- **Retries that know when to give up** — patient cooldowns on HTTP 429 and other transient errors; immediate exit on permanent ones (404, geo-restricted, video private, channel terminated).
+- **Resume-safe** — re-runs on a playlist skip items whose MKV already exists, matched by canonical name OR by `- ID <vid>` regex so renamed files still count.
+- **YouTube-client failover** — auto-cycles through `tv_embedded`, `web`+Node, `mweb`, `tv_html5_embed`, `android`, `ios`; remembers which one worked.
+- **Reliable subtitles** — two-pass approach guarantees `.srt` files exist before the media download starts; configurable strictness for required vs best-effort languages.
+- **Filesystem-aware filenames** — detects per-OS path/component limits and truncates the title (preserving uploader + ID) to avoid `ENAMETOOLONG`.
+- **Always-on housekeeping** — auto-updates `yt-dlp` at most once per 24h via the right mechanism for your install (`pipx upgrade` / `--update-to nightly`); passes `--cookies-from-browser firefox` automatically.
+- **Interactive controls** — `p` pause, `r` resume, `q`/`Esc` cancel (POSIX).
+- **Batch driver included** — `batch-yt2pass` extracts URLs from any text file and live-rereads it during a run so you can add or remove URLs while it is working.
 
 ## Table of Contents
 
@@ -25,11 +36,29 @@ yt2pass 'https://youtu.be/VIDEOID'
 
 ## What it does
 
-`yt-dlp` is a command-line program for downloading videos from YouTube and hundreds of other sites. It handles format selection, subtitle fetching, merging audio and video streams, and embedding subtitles into the output container. Most people use it and it mostly works.
+### Automatic format selection
 
-The problem surfaces with subtitles. YouTube will return an HTTP 429 (Too Many Requests) when you ask for subtitle files too quickly — and `yt-dlp` will log the error and continue, producing an MKV with no subtitles. There is also a distinction between human-made subtitles (uploaded by the creator or a professional) and automatically generated captions (machine-generated, often lower quality), and the two are accessed through different mechanisms. Some formats require a PO token (a short-lived credential tied to your browser session) to be fetched at all; YouTube's SABR streaming format has introduced additional instability since 2024.
+`yt2pass` inspects the available formats and prefers video-only streams so per-language audio can be muxed in; it falls back to progressive (combined audio + video) only when video-only is unavailable. The `--720p` flag picks the highest format at or below 720p, with a graceful fall-up to the smallest format above 720p if nothing lower exists. `--smallest` picks the lowest resolution and then the lowest bitrate. If YouTube only exposes the low-quality `mp4-low` format for a video — usually a transient condition — `yt2pass` waits and retries instead of accepting it, unless you opt in with `--go-low`.
 
-`yt2pass` solves this with a two-pass approach. Pass 1 probes the video metadata, identifies which subtitle tracks are actually present, and then retries the subtitle download with configurable cooldowns until all required `.srt` files are on disk. Only then does Pass 2 run, downloading the media and embedding the already-confirmed subtitles into the final MKV. If the subtitles cannot be retrieved after the configured number of tries, `yt2pass` stops before downloading any media, so you never end up with a large video file that is silently missing captions.
+### Multi-language audio
+
+Pass a list of language bases with `--langs` (for example, `--langs en,fr,ja`) and `yt2pass` picks the best audio-only format for each base, then muxes them all into a single MKV. Each audio track is tagged with its ISO-639-2 language code and a human-readable title via ffmpeg post-processor arguments, so video players show the right name in their language menus. The special code `orig` resolves to the video's detected original-language audio, taken from the highest-bitrate audio-only format that carries a language tag. Languages the video does not expose are skipped silently and reported in the log.
+
+### Retries that classify the failure
+
+`yt2pass` distinguishes transient errors from permanent ones. HTTP 429 ("Too Many Requests"), network blips, `mp4-low`-only states, and most non-zero `yt-dlp` exits trigger patient cooldowns and a retry, up to `--max-tries`. Permanent errors — HTTP 403, HTTP 404, geo restriction, "video unavailable", "video private", "channel terminated", "unsupported URL" — are recognized in `yt-dlp`'s stderr and the run exits immediately so you do not wait hours on an impossible download. In `--strict` mode, subtitle 429 storms back off exponentially up to an eight-hour cap.
+
+### Resume-friendly playlists and re-runs
+
+Before downloading anything, `yt2pass` checks the current directory for an MKV whose filename matches the title base, and skips the item if it finds one. If the canonical filename does not match (because you renamed or annotated the file), `yt2pass` searches for any media file containing `- ID <vid>` with a regex word boundary, so substring collisions cannot cause false matches. When a renamed file is found, `yt2pass` creates a same-directory symlink from the canonical name so subsequent runs hit the fast path. Per-language subtitle files are also checked individually, so partial subtitle progress is not lost between runs.
+
+### Reliable subtitles
+
+YouTube returns HTTP 429 when subtitle downloads come too fast, and plain `yt-dlp` keeps going — so you get a video file with no subs and no error. `yt2pass` solves this with two passes: pass 1 fetches subtitles with configurable cooldowns and retries until the `.srt` files exist on disk, and only then does pass 2 download the media. See [Subtitle modes explained](#subtitle-modes-explained) for the required-vs-best-effort behavior.
+
+### Always-on housekeeping
+
+`yt2pass` keeps `yt-dlp` itself up to date by attempting an upgrade at most once every 24 hours, using `pipx upgrade` when it detects a pipx-managed install or `yt-dlp --update-to nightly` for standalone installs. It always passes `--cookies-from-browser firefox` so cookie-gated formats work without per-run configuration. When YouTube blocks one player client (for example, the `web` client returns SABR-only URLs), `yt2pass` cycles through alternates — `tv_embedded`, `web` with Node + EJS, `mweb`, `tv_html5_embed`, `android`, `ios` — and remembers which one worked for the rest of the run.
 
 ## Installation
 
@@ -159,7 +188,12 @@ yt2pass --langs en,fr,ja 'https://youtu.be/VIDEOID'
 
 # Require auto-generated captions too, strictly
 yt2pass --auto --strict --langs en,orig 'https://youtu.be/VIDEOID'
+
+# Download with English, French, and Japanese audio muxed into one MKV
+yt2pass --langs en,fr,ja 'https://youtu.be/VIDEOID'
 ```
+
+With multiple language bases, `yt2pass` picks the best audio-only track for each language it can find, muxes them all into a single MKV, and tags each track with its language code and title. Languages not available on the video are skipped silently and reported in the log.
 
 Each run produces a single MKV file in the current directory named after the video title, uploader, and video ID. See [Configuration notes](#configuration-notes) for the filename pattern.
 

@@ -4,7 +4,7 @@ A `yt-dlp` wrapper that picks the right flags, retries on transient failures, an
 
 - **Multi-language audio in one file** — `--langs en,fr,ja` produces one MKV with three audio tracks, each tagged with its language.
 - **Automatic format selection** — prefers video-only formats so per-language audio can be muxed; `--720p` / `--smallest` shortcuts; gracefully refuses `mp4-low`-only states unless `--go-low`.
-- **Retries that know when to give up** — patient cooldowns on HTTP 429 and other transient errors; immediate exit on permanent ones (404, geo-restricted, video private, channel terminated).
+- **Retries that know when to give up** — patient cooldowns on HTTP 429 and other transient errors; immediate exit on permanent ones (404, geo-restricted, video private, account terminated).
 - **Resume-safe** — re-runs on a playlist skip items whose MKV already exists, matched by canonical name OR by `- ID <vid>` regex so renamed files still count.
 - **YouTube-client failover** — auto-cycles through `tv_embedded`, `web`+Node, `mweb`, `tv_html5_embed`, `android`, `ios`; remembers which one worked.
 - **Reliable subtitles** — two-pass approach guarantees `.srt` files exist before the media download starts; configurable strictness for required vs best-effort languages.
@@ -46,7 +46,7 @@ Pass a list of language bases with `--langs` (for example, `--langs en,fr,ja`) a
 
 ### Retries that classify the failure
 
-`yt2pass` distinguishes transient errors from permanent ones. HTTP 429 ("Too Many Requests"), network blips, `mp4-low`-only states, and most non-zero `yt-dlp` exits trigger patient cooldowns and a retry, up to `--max-tries`. Permanent errors — HTTP 403, HTTP 404, geo restriction, "video unavailable", "video private", "channel terminated", "unsupported URL" — are recognized in `yt-dlp`'s stderr and the run exits immediately so you do not wait hours on an impossible download. In `--strict` mode, subtitle 429 storms back off exponentially up to an eight-hour cap.
+`yt2pass` distinguishes transient errors from permanent ones. HTTP 429 ("Too Many Requests"), network blips, `mp4-low`-only states, and most non-zero `yt-dlp` exits trigger patient cooldowns and a retry, up to `--max-tries`. Permanent errors — HTTP 403, HTTP 404, geo restriction, "video unavailable", "video private", "account terminated", "unsupported URL" — are recognized in `yt-dlp`'s stderr and the run exits immediately so you do not wait hours on an impossible download. In `--strict` mode, subtitle 429 storms back off exponentially, starting at a one-hour base cooldown and capped at eight hours per attempt.
 
 ### Resume-friendly playlists and re-runs
 

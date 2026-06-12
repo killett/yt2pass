@@ -69,10 +69,10 @@ readlink -f ~/.local/bin/yt-dlp
 #   Optional libraries: ... curl_cffi ...
 #   JS runtimes: node
 
-TO UPGRADE:
+# TO UPGRADE:
 pipx upgrade --pip-args="--pre" yt-dlp
 
-TO INSTALL aria2c (optional downloader):
+# TO INSTALL aria2c (optional downloader):
 sudo apt-get update
 sudo apt-get install -y aria2
 ```
@@ -175,7 +175,7 @@ Use `batch-yt2pass` to process a list of URLs from a text file. The file can be 
 batch-yt2pass my-watchlist.txt
 ```
 
-`batch-yt2pass` reads the input file once before starting. It does not live-reread the file during a run; add new URLs to a separate file and start a new `batch-yt2pass` invocation for them. Three output files are written to the current directory as items complete:
+`batch-yt2pass` re-reads the input file before each URL it processes. URLs you add to the file while a run is in progress are picked up automatically; URLs you remove that have not yet been processed are dropped from the queue. Three output files are written to the current directory as items complete:
 
 - `<stamp>-yt2pass-successes-<base>` — one URL per line for each successful download
 - `<stamp>-yt2pass-failures-<base>` — failed URLs with the captured stdout/stderr from `yt2pass`
@@ -209,7 +209,7 @@ These hotkeys are not available on Windows.
 | `--rate-limit` | 0 | Download rate cap in kB/s; 0 means no limit |
 | `--nosubs` | false | Skip the subtitle pass entirely (still embeds any existing `.srt` files) |
 | `--onlysubs` | false | Download subtitles only, then exit without fetching media |
-| `--auto` | false | Also consider auto-generated captions, not just human-made subtitles |
+| `--auto` | false | Also fetch auto-generated captions; human-made subtitles remain required when present |
 | `--strict` | false | Treat all requested subtitle languages as hard requirements; use very long exponential backoff on 429s |
 | `--720p` | false | Prefer 720p video quality when choosing formats |
 | `--smallest` | false | Prefer the smallest available resolution |
@@ -243,7 +243,7 @@ These hotkeys are not available on Windows.
 
 ### Firefox cookies
 
-`yt2pass` always passes `--cookies-from-browser firefox` to `yt-dlp`. This is hardcoded in `_base_args` (`yt2pass:535`). You must have Firefox installed on your system and be logged into YouTube in Firefox for cookie-dependent formats to work. Future versions may expose this as a command-line flag; for now, Firefox is the only supported browser.
+`yt2pass` always passes `--cookies-from-browser firefox` to `yt-dlp`. This is hardcoded in `_base_args` (function defined at `yt2pass:529`). You must have Firefox installed on your system and be logged into YouTube in Firefox for cookie-dependent formats to work. Future versions may expose this as a command-line flag; for now, Firefox is the only supported browser.
 
 ### PO tokens
 
@@ -314,11 +314,11 @@ The retry file contains only the URLs that failed in the previous run, one per l
 | 0 | — | All requested work completed successfully |
 | 1 | `batch-yt2pass` | At least one URL in the batch failed |
 | 2 | `yt2pass` | `yt-dlp` missing, `--720p`+`--smallest` conflict, or invalid filename pattern |
+| 2 | `batch-yt2pass` | Input file not found |
 | 3 | `yt2pass` | Probe failed or playlist had no entries |
 | 126 | `batch-yt2pass` | Could not exec `yt2pass` |
 | 127 | `batch-yt2pass` | `yt2pass` not found on PATH |
 | 130 | `yt2pass` | KeyboardInterrupt / cancel key pressed |
-| non-zero | `yt2pass` | `yt-dlp` returned non-zero for an individual item (passed through) |
 
 ## `batch-yt2pass` output files
 

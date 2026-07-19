@@ -2023,20 +2023,34 @@ def _find_media_by_video_id(vid: str,
 
 
 def _symlink_media_alias(title_base: str, existing: Path) -> None:
-    """
-    Create a same-directory relative symlink from the expected canonical
-    filename (title_base + ext) to the existing (renamed/annotated) media
-    file, so future exact-match checks succeed on the fast path.
+    """Create a same-directory relative symlink from the canonical filename to an existing media file.
+
+    Stamps the symlink itself with the current time (not the target's
+    mtime) so consumers sorting by mtime group the alias with files
+    freshly created by the current playlist run.
+
+    Args:
+        title_base: Canonical title-based filename (without extension).
+        existing:   Path to the already-downloaded media file.
     """
     link_path = existing.parent / f"{title_base}{existing.suffix}"
     if link_path.exists() or link_path.is_symlink():
         return
     try:
         link_path.symlink_to(existing.name)
-        logging.info("Created symlink: %s -> %s", link_path.name, existing.name)
     except OSError as e:
         logging.warning("Could not create symlink %s -> %s: %s",
                         link_path.name, existing.name, e)
+        return
+
+    try:
+        os.utime(link_path, None, follow_symlinks=False)
+    except (NotImplementedError, OSError) as e:
+        logging.warning("Could not touch symlink mtime for %s: %s",
+                        link_path.name, e)
+
+    logging.info("Created symlink: %s -> %s",
+                 link_path.name, existing.name)
 
 
 def _entry_url(entry: dict) -> str:

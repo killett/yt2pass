@@ -58,27 +58,34 @@ sudo apt-get update
 sudo apt-get install -y pipx
 pipx ensurepath   # ok to ignore the “restart shell” hint for now
 
-# 2) Install yt-dlp (nightly / pre-release) via pipx and FORCE re-link the shim
-pipx install --force --pip-args="--pre" yt-dlp
+# 2) Install yt-dlp (nightly / pre-release) WITH the impersonation extra.
+#    Putting the extra in the install spec matters for two reasons:
+#      - pip resolves curl_cffi to a version yt-dlp will actually load. An
+#        unpinned "curl_cffi>=0.6.0" pulls a release newer than yt-dlp's
+#        supported range; yt-dlp then silently ignores it and every
+#        impersonate target shows as "(unavailable)".
+#      - pipx records the extra in its metadata, so `pipx reinstall` and
+#        `pipx install --force` preserve it. Packages added afterwards with
+#        `pipx runpip` are invisible to pipx and get dropped on reinstall.
+pipx install --force --pip-args="--pre" "yt-dlp[default,curl-cffi]"
 
-# 3) Add the impersonation dependency inside THAT venv
-pipx runpip yt-dlp install --upgrade "curl_cffi>=0.6.0"
-pipx runpip yt-dlp install -U "yt-dlp[default]"
-
-# 4) (Recommended) Install a JS runtime so yt-dlp can solve YouTube’s JS challenges
+# 3) (Recommended) Install a JS runtime so yt-dlp can solve YouTube's JS challenges
 sudo apt-get install -y nodejs
 
-# 5) Verify the right binary is being used and the shim points to the venv
+# 4) Verify the right binary is being used and that impersonation is live
 command -v yt-dlp
 readlink -f ~/.local/bin/yt-dlp
+yt-dlp --list-impersonate-targets      # targets must NOT say "(unavailable)"
 ~/.local/share/pipx/venvs/yt-dlp/bin/yt-dlp -v --ignore-config --version
-
 # You should see in the verbose header:
-#   Optional libraries: ... curl_cffi ...
+#   Optional libraries: ... curl_cffi-<version> ...   (without "(unsupported)")
 #   JS runtimes: node
 
 TO UPGRADE:
 pipx upgrade --pip-args="--pre" yt-dlp
+
+TO REPAIR impersonation without a full reinstall:
+pipx runpip yt-dlp install -U "yt-dlp[default,curl-cffi]"
 
 TO INSTALL aria2c (optional downloader):
 sudo apt-get update
@@ -102,6 +109,7 @@ import shutil
 import random
 import glob
 import re
+import urllib.parse
 import threading
 import select
 import signal
@@ -114,7 +122,7 @@ else:
     termios = None  # type: ignore[assignment]
     tty     = None  # type: ignore[assignment]
 
-__version__: str = "0.2.5"
+__version__: str = "0.2.6"
 
 _ORIG_STDIN_ATTRS: list[int] | None = None
 _STDIN_FD:               int | None = None
@@ -411,6 +419,7 @@ def main() -> None:
         logging.warning("ffmpeg not found on PATH. Subtitles may remain as .vtt/.ass; "
                         "conversion to .srt (requested via --convert-subs srt) will be skipped.")
 
+    _check_impersonation()
     _check_ytdlp_version(options)
 
     if not options.args.url:
@@ -1004,6 +1013,68 @@ def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+_IMPERSONATION_AVAILABLE: bool | None = None
+
+_IMPERSONATION_FIX_HINT = (
+    "Browser impersonation is UNAVAILABLE (curl_cffi missing, or a version "
+    "yt-dlp refuses to load). Sites whose extractors request impersonation "
+    "will fail with HTTP 403 / empty responses.\n"
+    "Repair in place:\n"
+    '    pipx runpip yt-dlp install -U "yt-dlp[default,curl-cffi]"\n'
+    "Or reinstall cleanly:\n"
+    '    pipx install --force --pip-args="--pre" "yt-dlp[default,curl-cffi]"\n'
+    "Verify with: yt-dlp --list-impersonate-targets"
+)
+
+
+def _impersonation_available() -> bool:
+    """
+    Return True if yt-dlp reports at least one usable impersonate target.
+
+    Parses `yt-dlp --list-impersonate-targets`: every target is listed whether
+    or not it works, and unusable ones are tagged "(unavailable)". Result is
+    cached for the lifetime of the process.
+    """
+    global _IMPERSONATION_AVAILABLE
+    if _IMPERSONATION_AVAILABLE is not None:
+        return _IMPERSONATION_AVAILABLE
+
+    _IMPERSONATION_AVAILABLE = False
+    exe = _find_ytdlp_exe()
+    if not exe:
+        return False
+    try:
+        cp = subprocess.run([exe, "--ignore-config", "--list-impersonate-targets"],
+                            check=False, capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Could not list impersonate targets: %s", e)
+        return False
+
+    for line in (cp.stdout or "").splitlines():
+        s = line.strip()
+        # Skip yt-dlp's "[info]" banner, the column header and the rule line.
+        if not s or s.startswith(("[", "-", "Client")):
+            continue
+        if "(unavailable)" not in s:
+            _IMPERSONATION_AVAILABLE = True
+            break
+    return _IMPERSONATION_AVAILABLE
+
+
+def _stderr_wants_impersonation(s: str | None) -> bool:
+    """True if yt-dlp complained that an extractor needed impersonation."""
+    return s is not None and "no impersonate target is available" in s.lower()
+
+
+def _check_impersonation() -> None:
+    """Log impersonation status once at startup, with repair steps if broken."""
+    if _impersonation_available():
+        logging.info("Browser impersonation available (curl_cffi loaded).")
+    else:
+        logging.warning("%s", _IMPERSONATION_FIX_HINT)
+
+
 def _ensure_aria_if_requested(options: Options) -> None:
     """
     If --aria was requested, verify that aria2c is installed and runnable.
@@ -1315,51 +1386,118 @@ def _ytdlp_streaming(*args: str) -> int:
     return _run_streaming((exe,) + args, check=False)
 
 
-def _probe_client_argsets() -> list[list[str]]:
+_YOUTUBE_HOST_RE = re.compile(
+    r"^(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be|youtube-nocookie\.com)$",
+    re.IGNORECASE)
+
+
+def _is_youtube_url(url: str) -> bool:
+    """
+    True if this URL belongs to YouTube, i.e. if youtube:player_client
+    extractor-args will have any effect at all.
+    """
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except Exception:
+        return False
+    if not host:
+        # Bare video IDs / search terms: assume YouTube. This script is
+        # YouTube-centric and the extra client fallbacks are harmless there.
+        return True
+    return bool(_YOUTUBE_HOST_RE.match(host))
+
+
+def _generic_argsets() -> list[list[str]]:
+    """
+    Fallback ladder for non-YouTube sites, where youtube:player_client args are
+    inert and would otherwise mean issuing the identical request N times.
+    """
+    argsets: list[list[str]] = [[]]                     # default handler
+    if _impersonation_available():
+        # Only ask for a target we know exists; otherwise yt-dlp hard-errors.
+        argsets.append(["--impersonate", "chrome"])
+    argsets.append(["--no-cookies-from-browser", "--no-cookies"])
+    return argsets
+
+
+def _probe_client_argsets(url: str) -> list[list[str]]:
     """
     Ordered client fallbacks for metadata probing.
     Each inner list will override any earlier --extractor-args in _base_args,
     because yt-dlp uses the last occurrence.
+
+    NOTE on cookies: --no-cookies clears --cookies (dest 'cookiefile') only.
+    _base_args always sets --cookies-from-browser (dest 'cookiesfrombrowser'),
+    so --no-cookies-from-browser is the flag that actually suppresses it.
     """
+    if not _is_youtube_url(url):
+        return _generic_argsets()
     return [
         # tv_embedded is usually pretty chill and doesn't trigger SABR as aggressively
         ["--extractor-args", "youtube:player_client=tv_embedded"],
         # web with Node+EJS (can solve signatures but may hit SABR URLs)
-        ["--extractor-args", "youtube:player_client=web", "--js-runtimes", "node", "--remote-components", "ejs:github"],
-        ["--extractor-args", "youtube:player_client=web", "--no-cookies", "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=web",
+         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=web",
+         "--no-cookies-from-browser", "--no-cookies",
+         "--js-runtimes", "node", "--remote-components", "ejs:github"],
         # mweb (may want PO tokens, but sometimes gives playable HLS without SABR)
-        ["--extractor-args", "youtube:player_client=mweb", "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=mweb",
+         "--js-runtimes", "node", "--remote-components", "ejs:github"],
         # tv_html5_embed (can be great, sometimes crashes)
         ["--extractor-args", "youtube:player_client=tv_html5_embed"],
         # lightweight app probes last
-        ["--extractor-args", "youtube:player_client=android", "--no-cookies"],
-        ["--extractor-args", "youtube:player_client=ios",     "--no-cookies"],
+        ["--extractor-args", "youtube:player_client=android",
+         "--no-cookies-from-browser", "--no-cookies"],
+        ["--extractor-args", "youtube:player_client=ios",
+         "--no-cookies-from-browser", "--no-cookies"],
     ]
 
 
 def _client_name_for_argset(argset: Sequence[str]) -> str:
     """
-    Extract the youtube:player_client name from a yt-dlp --extractor-args set.
-    
+    Short identifying name for a yt-dlp argset: the youtube:player_client value,
+    an 'impersonate:<target>' tag, or 'default' when neither is present, with a
+    '+nocookies' suffix when the argset suppresses browser cookies.
+
+    The name is both the log label and the _PREFERRED_YT_CLIENT reorder key, so
+    it must be unique within a ladder. Without the suffix the cookieless and
+    cookie-bearing variants of a client collide, which makes log lines ambiguous
+    and makes the reorder pull both rungs to the front when only one succeeded.
+
     Args:
         argset: Sequence of yt-dlp arguments.
-    
+
     Returns:
-        A simple string like 'tv_embedded', 'web', 'mweb', 'android', 'ios',
-        or 'unknown' if not present.
+        A string like 'tv_embedded', 'web', 'android+nocookies',
+        'impersonate:chrome', 'default', or 'default+nocookies'.
     """
-    for part in argset:
-        if isinstance(part, str) and part.startswith("youtube:player_client="):
-            return part.split("=", 1)[1]
-    return "unknown"
+    base = "default"
+    for i, part in enumerate(argset):
+        if not isinstance(part, str):
+            continue
+        if part.startswith("youtube:player_client="):
+            base = part.split("=", 1)[1]
+            break
+        if part == "--impersonate" and i + 1 < len(argset):
+            base = f"impersonate:{argset[i + 1]}"
+            break
+    if "--no-cookies-from-browser" in argset:
+        base += "+nocookies"
+    return base
 
 
-def _ordered_probe_client_argsets() -> list[list[str]]:
+def _argset_label(argset: Sequence[str]) -> str:
+    """Human-readable label for log lines (the empty argset is meaningful)."""
+    return " ".join(argset) if argset else "<default client>"
+
+
+def _ordered_probe_client_argsets(url: str) -> list[list[str]]:
     """
     Return probe client argsets, optionally reordered so that the last known
     successful client (_PREFERRED_YT_CLIENT) is tried first.
     """
-    base      = _probe_client_argsets()
+    base      = _probe_client_argsets(url)
     preferred = _PREFERRED_YT_CLIENT
     if not preferred:
         return base
@@ -1368,7 +1506,6 @@ def _ordered_probe_client_argsets() -> list[list[str]]:
     others:         list[list[str]] = []
     for a in base:
         (preferred_list if _client_name_for_argset(a) == preferred else others).append(a)
-
     # Only reorder if we actually found that client
     if preferred_list:
         return preferred_list + others
@@ -1387,8 +1524,9 @@ def _probe_info(options: Options, url: str) -> dict:
     """Fetch full metadata with small retries and multi-client fallback."""
     global _PREFERRED_YT_CLIENT
     max_outer = min(options.probe_max_outer, options.args.max_tries)
+    warned_impersonation = False
     for outer_try in range(1, max_outer + 1):
-        for argset in _ordered_probe_client_argsets():
+        for argset in _ordered_probe_client_argsets(url):
             cp = _ytdlp(
                 *_base_args(options, fast=True),
                 *argset,
@@ -1409,14 +1547,22 @@ def _probe_info(options: Options, url: str) -> dict:
                 # Show a short, helpful snippet of stderr for this attempt
                 msg  = (cp.stderr or "").strip().splitlines()
                 tail = " | ".join(msg[-3:]) if msg else "<no stderr>"
+                # Missing impersonation is a warning, not an error, so it is
+                # easily lost in the 3-line tail. Call it out once, loudly.
+                if (not warned_impersonation
+                        and _stderr_wants_impersonation(cp.stderr)
+                        and not _impersonation_available()):
+                    warned_impersonation = True
+                    logging.warning("This extractor requires browser impersonation. %s",
+                                    _IMPERSONATION_FIX_HINT)
                 # Detect permanent 'do_not_retry' errors and bail out immediately
                 if _stderr_is_do_not_retry(cp.stderr):
                     logging.warning(
                         "Probe failed with do_not_retry error (rc=%s) with args %s :: %s",
-                        cp.returncode, " ".join(argset), tail)
+                        cp.returncode, _argset_label(argset), tail)
                     raise RuntimeError(f"do_not_retry probe error: {tail}")
                 logging.warning("Probe failed (rc=%s) with args %s :: %s",
-                                cp.returncode, " ".join(argset), tail)
+                                cp.returncode, _argset_label(argset), tail)
         if outer_try < max_outer:
             logging.warning("Probe retry %d/%d …", outer_try, max_outer)
             _sleep_with_countdown(options, options.probe_retry_cooldown_secs, step=1)
@@ -2023,7 +2169,10 @@ def _find_media_by_video_id(vid: str,
 
 
 def _symlink_media_alias(title_base: str, existing: Path) -> None:
-    """Create a same-directory relative symlink from the canonical filename to an existing media file.
+    """
+    Create a same-directory relative symlink from the expected canonical
+    filename (title_base + ext) to the existing (renamed/annotated) media
+    file, so future exact-match checks succeed on the fast path.
 
     Stamps the symlink itself with the current time (not the target's
     mtime) so consumers sorting by mtime group the alias with files
@@ -2553,19 +2702,26 @@ def _pick_best_audio_for_base(formats: list[dict], base: str) -> dict | None:
     return max(cand, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0)) if cand else None
 
 
-def _media_blind_client_overrides() -> list[list[str]]:
+def _media_blind_client_overrides(url: str) -> list[list[str]]:
     """
     Base list of blind client overrides for media downloads, optionally
     reordered so that _PREFERRED_YT_CLIENT is tried first.
     """
+    if not _is_youtube_url(url):
+        return _generic_argsets()
+
     base: list[list[str]] = [
         # Most reliable first (default order):
         ["--extractor-args", "youtube:player_client=tv_html5_embed"],
         ["--extractor-args", "youtube:player_client=tv_embedded"],
-        ["--extractor-args", "youtube:player_client=web",  "--js-runtimes", "node", "--remote-components", "ejs:github"],
-        ["--extractor-args", "youtube:player_client=mweb", "--js-runtimes", "node", "--remote-components", "ejs:github"],
-        ["--extractor-args", "youtube:player_client=android", "--no-cookies"],
-        ["--extractor-args", "youtube:player_client=ios",     "--no-cookies"],
+        ["--extractor-args", "youtube:player_client=web",
+         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=mweb",
+         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+        ["--extractor-args", "youtube:player_client=android",
+         "--no-cookies-from-browser", "--no-cookies"],
+        ["--extractor-args", "youtube:player_client=ios",
+         "--no-cookies-from-browser", "--no-cookies"],
     ]
     preferred = _PREFERRED_YT_CLIENT
     if not preferred:
@@ -2575,7 +2731,6 @@ def _media_blind_client_overrides() -> list[list[str]]:
     others:         list[list[str]] = []
     for a in base:
         (preferred_list if _client_name_for_argset(a) == preferred else others).append(a)
-
     if preferred_list:
         return preferred_list + others
     return base
@@ -2667,10 +2822,13 @@ def _media_pass(options: Options, url: str,
 
         if not v:
             logging.warning("No downloadable formats found via probe; attempting blind download(s) with alternate clients …")
-            client_overrides = _media_blind_client_overrides()
+            client_overrides = _media_blind_client_overrides(url)
+            # Guard: `last_rc = rc_blind` after the loop would raise
+            # NameError if the override list were ever empty.
+            rc_blind: int = last_rc
             for override in client_overrides:
                 client_name = _client_name_for_argset(override)
-                logging.info("Blind attempt using client: %s", client_name)
+                logging.info("Blind attempt using client: %s", _argset_label(override))
                 blind_args = [*_base_args(options, fast=False),
                               *_media_args(options),
                               *override, url, *extra_args]

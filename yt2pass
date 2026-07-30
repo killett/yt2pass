@@ -547,6 +547,12 @@ def _base_args(options: Options, *, fast: bool = False) -> list[str]:
             "--merge-output-format", "mkv",
             "-o", options.output_template(),
             "--concurrent-fragments", "1"]
+    if _node_available():
+        # Generic yt-dlp infrastructure, not a YouTube-specific knob: name the
+        # JS interpreter once, globally, whenever one is installed. Naming it
+        # per-rung meant non-YouTube sites never got a runtime at all, and it
+        # was requested even on machines with no node.
+        args += ["--js-runtimes", "node"]
     if not fast:
         # General retry tuning
         div = max(1, options.ytdlp_extractor_retry_divisor)
@@ -1013,6 +1019,11 @@ def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _node_available() -> bool:
+    """Check if a Node.js runtime is available on PATH."""
+    return shutil.which("node") is not None
+
+
 _IMPERSONATION_AVAILABLE: bool | None = None
 
 _IMPERSONATION_FIX_HINT = (
@@ -1437,13 +1448,13 @@ def _probe_client_argsets(url: str) -> list[list[str]]:
         ["--extractor-args", "youtube:player_client=tv_embedded"],
         # web with Node+EJS (can solve signatures but may hit SABR URLs)
         ["--extractor-args", "youtube:player_client=web",
-         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+         "--remote-components", "ejs:github"],
         ["--extractor-args", "youtube:player_client=web",
          "--no-cookies-from-browser", "--no-cookies",
-         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+         "--remote-components", "ejs:github"],
         # mweb (may want PO tokens, but sometimes gives playable HLS without SABR)
         ["--extractor-args", "youtube:player_client=mweb",
-         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+         "--remote-components", "ejs:github"],
         # tv_html5_embed (can be great, sometimes crashes)
         ["--extractor-args", "youtube:player_client=tv_html5_embed"],
         # lightweight app probes last
@@ -2722,9 +2733,9 @@ def _media_blind_client_overrides(url: str) -> list[list[str]]:
         ["--extractor-args", "youtube:player_client=tv_html5_embed"],
         ["--extractor-args", "youtube:player_client=tv_embedded"],
         ["--extractor-args", "youtube:player_client=web",
-         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+         "--remote-components", "ejs:github"],
         ["--extractor-args", "youtube:player_client=mweb",
-         "--js-runtimes", "node", "--remote-components", "ejs:github"],
+         "--remote-components", "ejs:github"],
         ["--extractor-args", "youtube:player_client=android",
          "--no-cookies-from-browser", "--no-cookies"],
         ["--extractor-args", "youtube:player_client=ios",

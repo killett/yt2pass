@@ -3,7 +3,7 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -156,3 +156,54 @@ def test_generic_ladder_has_no_youtube_player_client(yt2pass, monkeypatch):
     for argset in yt2pass._generic_argsets():
         for part in argset:
             assert not part.startswith("youtube:player_client=")
+
+
+class _StubOptions:
+    """Minimal stand-in for Options, covering the fast=True path of _base_args."""
+
+    def __init__(self) -> None:
+        self.args = SimpleNamespace(rate_limit=0, aria=False)
+
+    def output_template(self) -> str:
+        return "%(title)s.%(ext)s"
+
+
+def test_node_available_follows_shutil_which(yt2pass, monkeypatch):
+    monkeypatch.setattr(yt2pass.shutil, "which",
+                        lambda name: "/usr/bin/node" if name == "node" else None)
+    assert yt2pass._node_available() is True
+    monkeypatch.setattr(yt2pass.shutil, "which", lambda name: None)
+    assert yt2pass._node_available() is False
+
+
+def test_base_args_requests_node_when_present(yt2pass, monkeypatch):
+    monkeypatch.setattr(yt2pass, "_node_available", lambda: True)
+    args = yt2pass._base_args(_StubOptions(), fast=True)
+    assert "--js-runtimes" in args
+    assert args[args.index("--js-runtimes") + 1] == "node"
+
+
+def test_base_args_omits_node_when_absent(yt2pass, monkeypatch):
+    monkeypatch.setattr(yt2pass, "_node_available", lambda: False)
+    args = yt2pass._base_args(_StubOptions(), fast=True)
+    assert "--js-runtimes" not in args
+
+
+def test_no_ladder_rung_names_a_js_runtime(yt2pass, yt_url):
+    for ladder in (yt2pass._probe_client_argsets(yt_url),
+                   yt2pass._media_blind_client_overrides(yt_url)):
+        for argset in ladder:
+            assert "--js-runtimes" not in argset
+
+
+def test_web_and_mweb_rungs_keep_the_ejs_component(yt2pass, yt_url):
+    checked = 0
+    for ladder in (yt2pass._probe_client_argsets(yt_url),
+                   yt2pass._media_blind_client_overrides(yt_url)):
+        for argset in ladder:
+            name = yt2pass._client_name_for_argset(argset)
+            if name.startswith(("web", "mweb")):
+                assert "--remote-components" in argset
+                assert argset[argset.index("--remote-components") + 1] == "ejs:github"
+                checked += 1
+    assert checked == 5, f"expected 5 web/mweb rungs, checked {checked}"

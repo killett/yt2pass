@@ -1451,6 +1451,13 @@ def _probe_client_argsets(url: str) -> list[list[str]]:
          "--no-cookies-from-browser", "--no-cookies"],
         ["--extractor-args", "youtube:player_client=ios",
          "--no-cookies-from-browser", "--no-cookies"],
+        # Same two clients again, this time WITH the browser cookies that
+        # _base_args always supplies. Cookieless is the better default for
+        # these clients, so it goes first; but a gated video (age-restricted,
+        # members-only, private) may be servable only here, and this ladder is
+        # reached only after everything above has already failed.
+        ["--extractor-args", "youtube:player_client=android"],
+        ["--extractor-args", "youtube:player_client=ios"],
     ]
 
 
@@ -2722,6 +2729,9 @@ def _media_blind_client_overrides(url: str) -> list[list[str]]:
          "--no-cookies-from-browser", "--no-cookies"],
         ["--extractor-args", "youtube:player_client=ios",
          "--no-cookies-from-browser", "--no-cookies"],
+        # Cookie-bearing last resort; see the note in _probe_client_argsets.
+        ["--extractor-args", "youtube:player_client=android"],
+        ["--extractor-args", "youtube:player_client=ios"],
     ]
     preferred = _PREFERRED_YT_CLIENT
     if not preferred:

@@ -119,3 +119,40 @@ def test_every_generic_rung_has_a_unique_name(yt2pass, monkeypatch, impersonatio
     ladder = yt2pass._generic_argsets()
     names = [yt2pass._client_name_for_argset(a) for a in ladder]
     assert len(set(names)) == len(names), f"duplicate rung names: {names}"
+
+
+def test_probe_ladder_ends_with_cookie_bearing_android_and_ios(yt2pass, yt_url):
+    ladder = yt2pass._probe_client_argsets(yt_url)
+    names = [yt2pass._client_name_for_argset(a) for a in ladder]
+    assert names[-2:] == ["android", "ios"]
+    for argset in ladder[-2:]:
+        assert "--no-cookies-from-browser" not in argset
+
+
+def test_media_ladder_ends_with_cookie_bearing_android_and_ios(yt2pass, yt_url):
+    ladder = yt2pass._media_blind_client_overrides(yt_url)
+    names = [yt2pass._client_name_for_argset(a) for a in ladder]
+    assert names[-2:] == ["android", "ios"]
+    for argset in ladder[-2:]:
+        assert "--no-cookies-from-browser" not in argset
+
+
+def test_probe_ladder_tries_cookieless_before_cookie_bearing(yt2pass, yt_url):
+    names = [yt2pass._client_name_for_argset(a)
+             for a in yt2pass._probe_client_argsets(yt_url)]
+    assert names.index("android+nocookies") < names.index("android")
+    assert names.index("ios+nocookies") < names.index("ios")
+
+
+def test_media_ladder_tries_cookieless_before_cookie_bearing(yt2pass, yt_url):
+    names = [yt2pass._client_name_for_argset(a)
+             for a in yt2pass._media_blind_client_overrides(yt_url)]
+    assert names.index("android+nocookies") < names.index("android")
+    assert names.index("ios+nocookies") < names.index("ios")
+
+
+def test_generic_ladder_has_no_youtube_player_client(yt2pass, monkeypatch):
+    monkeypatch.setattr(yt2pass, "_impersonation_available", lambda: True)
+    for argset in yt2pass._generic_argsets():
+        for part in argset:
+            assert not part.startswith("youtube:player_client=")

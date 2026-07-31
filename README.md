@@ -58,7 +58,7 @@ YouTube returns HTTP 429 when subtitle downloads come too fast, and plain `yt-dl
 
 ### Always-on housekeeping
 
-`yt2pass` keeps `yt-dlp` itself up to date by attempting an upgrade at most once every 24 hours, using `pipx upgrade` when it detects a pipx-managed install or `yt-dlp --update-to nightly` for standalone installs. It always passes `--cookies-from-browser firefox` so cookie-gated formats work without per-run configuration. When YouTube blocks one player client (for example, the `web` client returns SABR-only URLs), `yt2pass` cycles through alternates — `tv_embedded`, `web` with Node + EJS, `mweb`, `tv_html5_embed`, `android`, `ios` — and remembers which one worked for the rest of the run.
+`yt2pass` keeps `yt-dlp` itself up to date by attempting an upgrade at most once every 24 hours, using `pipx upgrade` when it detects a pipx-managed install or `yt-dlp --update-to nightly` for standalone installs. It always passes `--cookies-from-browser firefox` so cookie-gated formats work without per-run configuration. When YouTube blocks one player client (for example, the `web` client returns SABR-only URLs), `yt2pass` cycles through alternates — `tv_embedded`, `web` with Node + EJS, `web` without browser cookies, `mweb`, `tv_html5_embed`, then `android` and `ios` without browser cookies, and finally `android` and `ios` *with* them as a last resort for age-restricted, members-only or private videos — and remembers which one worked for the rest of the run. Non-YouTube URLs skip that ladder entirely: `youtube:player_client` arguments are inert elsewhere, so those sites get a short generic ladder instead (default handler, browser impersonation when available, then a cookie-free retry).
 
 ## Installation
 
@@ -79,38 +79,47 @@ sudo apt-get update
 sudo apt-get install -y pipx
 pipx ensurepath   # ok to ignore the "restart shell" hint for now
 
-# 2) Install yt-dlp (nightly / pre-release) via pipx and FORCE re-link the shim
-pipx install --force --pip-args="--pre" yt-dlp
+# 2) Install yt-dlp (nightly / pre-release) WITH the impersonation extra
+pipx install --force --pip-args="--pre" "yt-dlp[default,curl-cffi]"
 
-# 3) Add the impersonation dependency inside THAT venv
-pipx runpip yt-dlp install --upgrade "curl_cffi>=0.6.0"
-pipx runpip yt-dlp install -U "yt-dlp[default]"
-
-# 4) (Recommended) Install a JS runtime so yt-dlp can solve YouTube's JS challenges
+# 3) (Recommended) Install a JS runtime so yt-dlp can solve YouTube's JS challenges
 sudo apt-get install -y nodejs
 
-# 5) Verify the right binary is being used and the shim points to the venv
+# 4) Verify the right binary is being used and that impersonation is live
 command -v yt-dlp
 readlink -f ~/.local/bin/yt-dlp
+yt-dlp --list-impersonate-targets      # targets must NOT say "(unavailable)"
 ~/.local/share/pipx/venvs/yt-dlp/bin/yt-dlp -v --ignore-config --version
 
 # You should see in the verbose header:
-#   Optional libraries: ... curl_cffi ...
+#   Optional libraries: ... curl_cffi-<version> ...   (without "(unsupported)")
 #   JS runtimes: node
 
 # TO UPGRADE:
 pipx upgrade --pip-args="--pre" yt-dlp
+
+# TO REPAIR impersonation without a full reinstall:
+pipx runpip yt-dlp install -U "yt-dlp[default,curl-cffi]"
 
 # TO INSTALL aria2c (optional downloader):
 sudo apt-get update
 sudo apt-get install -y aria2
 ```
 
+**Put the impersonation extra in the install spec** — `"yt-dlp[default,curl-cffi]"` — rather than adding `curl_cffi` afterwards. This matters for two reasons:
+
+- `pip` resolves `curl_cffi` to a version `yt-dlp` will actually load. An unpinned `curl_cffi>=0.6.0` pulls a release newer than `yt-dlp`'s supported range; `yt-dlp` then silently ignores it and every impersonate target shows as `(unavailable)`.
+- `pipx` records the extra in its metadata, so `pipx reinstall` and `pipx install --force` preserve it. Packages added afterwards with `pipx runpip` are invisible to `pipx` and get dropped on reinstall.
+
+If `yt-dlp --list-impersonate-targets` shows targets marked `(unavailable)`, browser impersonation is not working and sites whose extractors request it will fail with HTTP 403 or empty responses. `yt2pass` detects this and prints repair instructions when an extractor actually needs impersonation.
+
 To upgrade `yt-dlp` later:
 
 ```bash
 pipx upgrade --pip-args="--pre" yt-dlp
 ```
+
+Use a recent `yt-dlp` — the nightly/pre-release channel above is the supported configuration. `yt2pass` passes `--js-runtimes node` whenever a `node` binary is on your `PATH`, and that option only exists on newer `yt-dlp` builds; pairing an installed Node with an older pinned `yt-dlp` will make every invocation fail on an unrecognised option.
 
 #### ffmpeg
 

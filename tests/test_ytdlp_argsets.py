@@ -207,3 +207,48 @@ def test_web_and_mweb_rungs_keep_the_ejs_component(yt2pass, yt_url):
                 assert argset[argset.index("--remote-components") + 1] == "ejs:github"
                 checked += 1
     assert checked == 5, f"expected 5 web/mweb rungs, checked {checked}"
+
+
+# --- YouTube/generic routing wiring ---------------------------------------
+#
+# _probe_client_argsets(url) and _media_blind_client_overrides(url) each start
+# with `if not _is_youtube_url(url): return _generic_argsets()`. Every ladder
+# test above uses the yt_url fixture, so it never exercises that guard, and
+# test_generic_ladder_has_no_youtube_player_client calls _generic_argsets()
+# directly, bypassing the routing entirely. These tests pin the guard itself:
+# delete either `if not _is_youtube_url(url): ...` line and one of the tests
+# below must fail.
+
+_NON_YOUTUBE_URL = "https://vimeo.com/123456"
+
+
+@pytest.mark.parametrize("impersonation", [True, False])
+def test_probe_argsets_route_non_youtube_url_to_generic_ladder(
+        yt2pass, monkeypatch, impersonation):
+    monkeypatch.setattr(yt2pass, "_impersonation_available", lambda: impersonation)
+    assert (yt2pass._probe_client_argsets(_NON_YOUTUBE_URL)
+            == yt2pass._generic_argsets())
+
+
+@pytest.mark.parametrize("impersonation", [True, False])
+def test_media_argsets_route_non_youtube_url_to_generic_ladder(
+        yt2pass, monkeypatch, impersonation):
+    monkeypatch.setattr(yt2pass, "_impersonation_available", lambda: impersonation)
+    assert (yt2pass._media_blind_client_overrides(_NON_YOUTUBE_URL)
+            == yt2pass._generic_argsets())
+
+
+def test_probe_argsets_do_not_route_youtube_url_to_generic_ladder(yt2pass, yt_url):
+    ladder = yt2pass._probe_client_argsets(yt_url)
+    assert any(
+        isinstance(part, str) and part.startswith("youtube:player_client=")
+        for argset in ladder for part in argset
+    ), f"expected a youtube:player_client rung, got {ladder!r}"
+
+
+def test_media_argsets_do_not_route_youtube_url_to_generic_ladder(yt2pass, yt_url):
+    ladder = yt2pass._media_blind_client_overrides(yt_url)
+    assert any(
+        isinstance(part, str) and part.startswith("youtube:player_client=")
+        for argset in ladder for part in argset
+    ), f"expected a youtube:player_client rung, got {ladder!r}"

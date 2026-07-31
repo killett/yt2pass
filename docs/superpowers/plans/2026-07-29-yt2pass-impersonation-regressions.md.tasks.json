@@ -4,13 +4,13 @@
     {
       "id": 0,
       "subject": "Task 1: Characterisation tests for URL routing and stderr classification",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Create the inner-repo test module with a fresh-module fixture and lock in the current behaviour of `_is_youtube_url` and `_stderr_wants_impersonation` before anything else changes.\n\n**Files:**\n- Create: `/workspace/yt2pass/tests/test_ytdlp_argsets.py`\n- Test: `/workspace/yt2pass/tests/test_ytdlp_argsets.py`\n\n**Acceptance Criteria:**\n- [ ] `_load_yt2pass()` returns a freshly executed module, so module-level caches never leak between tests\n- [ ] `_is_youtube_url` returns True for `youtube.com`, `www.youtube.com`, `music.youtube.com`, `youtu.be`, `youtube-nocookie.com`, and a bare video ID\n- [ ] `_is_youtube_url` returns False for `vimeo.com`, `notyoutube.com`, `evil-youtube.com`, and `youtube.com.evil.test`\n- [ ] `_stderr_wants_impersonation` handles `None`, `\"\"`, the exact phrase, and an upper-cased phrase\n- [ ] No test invokes `subprocess` or the network\n\n**Verify:** `cd /workspace && pixi run python -m pytest yt2pass/tests/test_ytdlp_argsets.py -v` \u2192 all pass\n\n```json:metadata\n{\"files\": [\"/workspace/yt2pass/tests/test_ytdlp_argsets.py\"], \"verifyCommand\": \"cd /workspace && pixi run python -m pytest yt2pass/tests/test_ytdlp_argsets.py -v\", \"modelTier\": \"mechanical\", \"acceptanceCriteria\": [\"`_load_yt2pass()` returns a freshly executed module, so module-level caches never leak between tests\", \"`_is_youtube_url` returns True for `youtube.com`, `www.youtube.com`, `music.youtube.com`, `youtu.be`, `youtube-nocookie.com`, and a bare video ID\", \"`_is_youtube_url` returns False for `vimeo.com`, `notyoutube.com`, `evil-youtube.com`, and `youtube.com.evil.test`\", \"`_stderr_wants_impersonation` handles `None`, `\\\"\\\"`, the exact phrase, and an upper-cased phrase\", \"No test invokes `subprocess` or the network\"]}\n```"
     },
     {
       "id": 1,
       "subject": "Task 2: Give every ladder rung a unique name (R7)",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Add a `+nocookies` suffix to `_client_name_for_argset` so cookieless and cookie-bearing variants of the same client stop colliding in log lines and in the `_PREFERRED_YT_CLIENT` reorder key.\n\n**Files:**\n- Modify: `/workspace/yt2pass/yt2pass` \u2014 `_client_name_for_argset`\n- Test: `/workspace/yt2pass/tests/test_ytdlp_argsets.py`\n\n**Acceptance Criteria:**\n- [ ] `_client_name_for_argset` returns `android+nocookies` for a cookieless android rung and `android` for a cookie-bearing one\n- [ ] `[]` returns `default`; `[\"--no-cookies-from-browser\", \"--no-cookies\"]` returns `default+nocookies`\n- [ ] `[\"--impersonate\", \"chrome\"]` still returns `impersonate:chrome`\n- [ ] Every rung in the YouTube probe ladder, the YouTube media ladder, and the generic ladder has a unique name\n- [ ] `_argset_label` is unchanged\n\n**Verify:** `cd /workspace && pixi run python -m pytest yt2pass/tests/test_ytdlp_argsets.py -v` \u2192 all pass\n\n```json:metadata\n{\"files\": [\"/workspace/yt2pass/yt2pass\", \"/workspace/yt2pass/tests/test_ytdlp_argsets.py\"], \"verifyCommand\": \"cd /workspace && pixi run test\", \"modelTier\": \"standard\", \"acceptanceCriteria\": [\"`_client_name_for_argset` returns `android+nocookies` for a cookieless android rung and `android` for a cookie-bearing one\", \"`[]` returns `default`; `[\\\"--no-cookies-from-browser\\\", \\\"--no-cookies\\\"]` returns `default+nocookies`\", \"`[\\\"--impersonate\\\", \\\"chrome\\\"]` still returns `impersonate:chrome`\", \"Every rung in the YouTube probe ladder, the YouTube media ladder, and the generic ladder has a unique name\", \"`_argset_label` is unchanged\"]}\n```",
       "blockedBy": [
         0
@@ -19,7 +19,7 @@
     {
       "id": 2,
       "subject": "Task 3: Add cookie-bearing android/ios last-resort rungs (R1)",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Restore access to gated videos that only the android or ios client can serve, by appending cookie-bearing variants of those two clients to the end of both YouTube ladders.\n\n**Files:**\n- Modify: `/workspace/yt2pass/yt2pass` \u2014 `_probe_client_argsets`, `_media_blind_client_overrides`\n- Test: `/workspace/yt2pass/tests/test_ytdlp_argsets.py`\n\n**Acceptance Criteria:**\n- [ ] The YouTube probe ladder has 9 rungs; the last two are android and ios with no `--no-cookies-from-browser`\n- [ ] The YouTube media ladder has 8 rungs; the last two are android and ios with no `--no-cookies-from-browser`\n- [ ] In both ladders the cookieless variant of each client is tried strictly before the cookie-bearing one\n- [ ] The uniqueness tests from Task 2 still pass over the longer ladders\n- [ ] The generic ladder is unaffected\n\n**Verify:** `cd /workspace && pixi run test` \u2192 all pass\n\n```json:metadata\n{\"files\": [\"/workspace/yt2pass/yt2pass\", \"/workspace/yt2pass/tests/test_ytdlp_argsets.py\"], \"verifyCommand\": \"cd /workspace && pixi run test\", \"modelTier\": \"mechanical\", \"acceptanceCriteria\": [\"The YouTube probe ladder has 9 rungs; the last two are android and ios with no `--no-cookies-from-browser`\", \"The YouTube media ladder has 8 rungs; the last two are android and ios with no `--no-cookies-from-browser`\", \"In both ladders the cookieless variant of each client is tried strictly before the cookie-bearing one\", \"The uniqueness tests from Task 2 still pass over the longer ladders\", \"The generic ladder is unaffected\"]}\n```",
       "blockedBy": [
         1
@@ -28,7 +28,7 @@
     {
       "id": 3,
       "subject": "Task 4: Hoist the JS runtime into `_base_args` (R2)",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Give non-YouTube sites a JS runtime again by moving `--js-runtimes node` out of four YouTube-only rungs into `_base_args`, gated on node actually being installed.\n\n**Files:**\n- Modify: `/workspace/yt2pass/yt2pass` \u2014 new `_node_available`, `_base_args`, `_probe_client_argsets`, `_media_blind_client_overrides`\n- Test: `/workspace/yt2pass/tests/test_ytdlp_argsets.py`\n\n**Acceptance Criteria:**\n- [ ] `_node_available()` returns True iff `shutil.which(\"node\")` is not None\n- [ ] `_base_args` includes `--js-runtimes node` when node is available and omits it when not\n- [ ] No rung in either YouTube ladder contains `--js-runtimes`\n- [ ] Every `web` and `mweb` rung still carries `--remote-components ejs:github`\n- [ ] The generic ladder still contains no `youtube:player_client`\n\n**Verify:** `cd /workspace && pixi run test` \u2192 all pass\n\n```json:metadata\n{\"files\": [\"/workspace/yt2pass/yt2pass\", \"/workspace/yt2pass/tests/test_ytdlp_argsets.py\"], \"verifyCommand\": \"cd /workspace && pixi run test\", \"modelTier\": \"standard\", \"acceptanceCriteria\": [\"`_node_available()` returns True iff `shutil.which(\\\"node\\\")` is not None\", \"`_base_args` includes `--js-runtimes node` when node is available and omits it when not\", \"No rung in either YouTube ladder contains `--js-runtimes`\", \"Every `web` and `mweb` rung still carries `--remote-components ejs:github`\", \"The generic ladder still contains no `youtube:player_client`\"]}\n```",
       "blockedBy": [
         2
@@ -37,7 +37,7 @@
     {
       "id": 4,
       "subject": "Task 5: Make the impersonation probe lazy with an honest cache (R4, R6)",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Stop spawning a yt-dlp subprocess on every invocation, and stop a single timeout from disabling impersonation for the rest of the run.\n\n**Files:**\n- Modify: `/workspace/yt2pass/yt2pass` \u2014 `_impersonation_available`, delete `_check_impersonation`, remove its call in `main()`\n- Create: `/workspace/yt2pass/tests/test_impersonation.py`\n\n**Acceptance Criteria:**\n- [ ] A completed subprocess run is cached: a second call does not re-invoke `subprocess.run`\n- [ ] A `TimeoutExpired` is not cached: a second call does re-invoke `subprocess.run`\n- [ ] A missing yt-dlp executable returns False without invoking `subprocess.run`\n- [ ] A table mixing usable rows and `(unavailable)` rows returns True; an all-`(unavailable)` table returns False\n- [ ] The `[info]` banner, the `Client ...` header row and the `-----` rule row are never counted as targets\n- [ ] `_check_impersonation` no longer exists and `main()` does not call it\n- [ ] `_generic_argsets()` includes `--impersonate chrome` only when impersonation is available\n\n**Verify:** `cd /workspace && pixi run python -m pytest yt2pass/tests/test_impersonation.py -v` \u2192 all pass\n\n```json:metadata\n{\"files\": [\"/workspace/yt2pass/yt2pass\", \"/workspace/yt2pass/tests/test_impersonation.py\"], \"verifyCommand\": \"cd /workspace && pixi run test\", \"modelTier\": \"standard\", \"acceptanceCriteria\": [\"A completed subprocess run is cached: a second call does not re-invoke `subprocess.run`\", \"A `TimeoutExpired` is not cached: a second call does re-invoke `subprocess.run`\", \"A missing yt-dlp executable returns False without invoking `subprocess.run`\", \"A table mixing usable rows and `(unavailable)` rows returns True; an all-`(unavailable)` table returns False\", \"The `[info]` banner, the `Client ...` header row and the `-----` rule row are never counted as targets\", \"`_check_impersonation` no longer exists and `main()` does not call it\", \"`_generic_argsets()` includes `--impersonate chrome` only when impersonation is available\"]}\n```",
       "blockedBy": [
         3
@@ -46,7 +46,7 @@
     {
       "id": 5,
       "subject": "Task 6: Restore log-line correlation and document the generic ladder depth (R5, R3)",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Make the blind-attempt start line use the same identifier as the failure lines below it, and record why the generic ladder is deliberately shorter than the YouTube one.\n\n**Files:**\n- Modify: `/workspace/yt2pass/yt2pass` \u2014 `_media_pass` blind-attempt log line, `_generic_argsets` docstring\n\n**Acceptance Criteria:**\n- [ ] The blind-attempt start line logs `client_name`, matching the failure and debug lines in the same loop\n- [ ] `_argset_label` is still used in the two `_probe_info` failure warnings\n- [ ] `_generic_argsets` documents why three rungs is correct and where the retry cushion actually comes from\n- [ ] No behavioural change beyond the log string\n\n**Verify:** `cd /workspace && pixi run test` \u2192 all pass, and `rg -n '_argset_label' yt2pass/yt2pass` shows exactly the definition plus the two `_probe_info` call sites\n\n```json:metadata\n{\"files\": [\"/workspace/yt2pass/yt2pass\"], \"verifyCommand\": \"cd /workspace && pixi run test && rg -n '_argset_label' yt2pass/yt2pass\", \"modelTier\": \"mechanical\", \"acceptanceCriteria\": [\"The blind-attempt start line logs `client_name`, matching the failure and debug lines in the same loop\", \"`_argset_label` is still used in the two `_probe_info` failure warnings\", \"`_generic_argsets` documents why three rungs is correct and where the retry cushion actually comes from\", \"No behavioural change beyond the log string\"]}\n```",
       "blockedBy": [
         4
@@ -55,12 +55,12 @@
     {
       "id": 6,
       "subject": "Task 7: Full verification sweep",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Confirm the finished script introduces no new lint or type findings versus `HEAD`, still compiles, keeps its exec bit, and passes every test.\n\n**Files:**\n- Modify: none\n\n**Acceptance Criteria:**\n- [ ] `pixi run test` passes with 42 tests\n- [ ] The ruff finding set for the script is identical to `HEAD`'s\n- [ ] The mypy finding set for the script is identical to `HEAD`'s\n- [ ] The script byte-compiles\n- [ ] The file mode is `100755`\n- [ ] `__version__` is still `\"0.2.6\"`\n- [ ] `pixi run pre-commit run --all-files` passes\n- [ ] The outer `/workspace` repo has no new commits\n\n**Verify:** every command below produces its stated expected output\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"cd /workspace && pixi run test && pixi run pre-commit run --all-files\", \"modelTier\": \"standard\", \"acceptanceCriteria\": [\"`pixi run test` passes with 42 tests\", \"The ruff finding set for the script is identical to `HEAD`'s\", \"The mypy finding set for the script is identical to `HEAD`'s\", \"The script byte-compiles\", \"The file mode is `100755`\", \"`__version__` is still `\\\"0.2.6\\\"`\", \"`pixi run pre-commit run --all-files` passes\", \"The outer `/workspace` repo has no new commits\"]}\n```",
       "blockedBy": [
         5
       ]
     }
   ],
-  "lastUpdated": "2026-07-29"
+  "lastUpdated": "2026-07-30"
 }

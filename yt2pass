@@ -1419,6 +1419,12 @@ def _generic_argsets() -> list[list[str]]:
     """
     Fallback ladder for non-YouTube sites, where youtube:player_client args are
     inert and would otherwise mean issuing the identical request N times.
+
+    Three rungs is deliberate, not an oversight. The seven-rung YouTube ladder
+    is not seven retries for a non-YouTube URL: the extractor-args are ignored,
+    so it would issue the same request repeatedly. The cushion for transient
+    failures comes from the outer probe_max_outer loop with its cooldown, and
+    from --retries/--extractor-retries in _base_args.
     """
     argsets: list[list[str]] = [[]]                     # default handler
     if _impersonation_available():
@@ -2846,7 +2852,7 @@ def _media_pass(options: Options, url: str,
             rc_blind: int = last_rc
             for override in client_overrides:
                 client_name = _client_name_for_argset(override)
-                logging.info("Blind attempt using client: %s", _argset_label(override))
+                logging.info("Blind attempt using client: %s", client_name)
                 blind_args = [*_base_args(options, fast=False),
                               *_media_args(options),
                               *override, url, *extra_args]

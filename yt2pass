@@ -419,7 +419,6 @@ def main() -> None:
         logging.warning("ffmpeg not found on PATH. Subtitles may remain as .vtt/.ass; "
                         "conversion to .srt (requested via --convert-subs srt) will be skipped.")
 
-    _check_impersonation()
     _check_ytdlp_version(options)
 
     if not options.args.url:
@@ -1042,15 +1041,18 @@ def _impersonation_available() -> bool:
     """
     Return True if yt-dlp reports at least one usable impersonate target.
 
-    Parses `yt-dlp --list-impersonate-targets`: every target is listed whether
-    or not it works, and unusable ones are tagged "(unavailable)". Result is
-    cached for the lifetime of the process.
+    Parses `yt-dlp --list-impersonate-targets`: every known target is listed
+    whether or not it works, and unusable ones are tagged "(unavailable)".
+
+    The result is cached for the lifetime of the process, but only when the
+    subprocess actually ran to completion. A missing executable or a timeout
+    leaves the cache unset so a later call retries; caching those would let one
+    slow start suppress --impersonate for the rest of the run.
     """
     global _IMPERSONATION_AVAILABLE
     if _IMPERSONATION_AVAILABLE is not None:
         return _IMPERSONATION_AVAILABLE
 
-    _IMPERSONATION_AVAILABLE = False
     exe = _find_ytdlp_exe()
     if not exe:
         return False
@@ -1062,28 +1064,23 @@ def _impersonation_available() -> bool:
             logging.debug("Could not list impersonate targets: %s", e)
         return False
 
+    available = False
     for line in (cp.stdout or "").splitlines():
         s = line.strip()
         # Skip yt-dlp's "[info]" banner, the column header and the rule line.
         if not s or s.startswith(("[", "-", "Client")):
             continue
         if "(unavailable)" not in s:
-            _IMPERSONATION_AVAILABLE = True
+            available = True
             break
-    return _IMPERSONATION_AVAILABLE
+
+    _IMPERSONATION_AVAILABLE = available
+    return available
 
 
 def _stderr_wants_impersonation(s: str | None) -> bool:
     """True if yt-dlp complained that an extractor needed impersonation."""
     return s is not None and "no impersonate target is available" in s.lower()
-
-
-def _check_impersonation() -> None:
-    """Log impersonation status once at startup, with repair steps if broken."""
-    if _impersonation_available():
-        logging.info("Browser impersonation available (curl_cffi loaded).")
-    else:
-        logging.warning("%s", _IMPERSONATION_FIX_HINT)
 
 
 def _ensure_aria_if_requested(options: Options) -> None:

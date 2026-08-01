@@ -1,8 +1,51 @@
 # yt2pass impersonation-change regressions — design
 
 Date: 2026-07-29
-Status: approved, ready for planning
+Status: implemented, **partially superseded** — see Correction below
 Scope: `yt2pass/yt2pass` (single script), `tests/`
+
+## Correction (2026-08-01): R1 was not a regression
+
+**R1's premise is false. Everything this document says about it is wrong, and
+the fix it specifies was implemented and then reverted.** R2 through R7 stand
+as written and remain in the code.
+
+The rest of this document is preserved unedited as a record of what was
+believed on 2026-07-29. Read the R1 material below as history, not as guidance.
+
+Empirical check against yt-dlp 2026.07 with curl_cffi-0.13.0, running
+`player_client=android` with `--cookies-from-browser firefox` against an
+age-restricted video:
+
+```
+WARNING: [youtube] Skipping client "android" since it does not support cookies
+WARNING: Only images are available for download.
+```
+
+yt-dlp does not ignore cookies for the `android`/`ios` clients — it **skips the
+client entirely**, yielding no formats at all. Three consequences:
+
+1. A cookie-bearing `android`/`ios` rung is strictly worse than its cookieless
+   neighbour, not a last-resort chance at a gated video. It cannot ever succeed.
+2. These clients cannot serve age-restricted, members-only or private videos
+   under any configuration, because cookie authentication is precisely what they
+   refuse. The cookie-authenticated clients earlier in the ladder are what handle
+   gated content.
+3. The direction of the original change was backwards. Before the manual edit
+   these rungs carried `--no-cookies`, which clears `--cookies` but never
+   `--cookies-from-browser` — so browser cookies were always present and yt-dlp
+   was skipping `android`/`ios` on every run. Adding `--no-cookies-from-browser`
+   **repaired** those rungs. It never lost gated-video access.
+
+What actually shipped: the four appended rungs were removed in `eb12110`, the
+ladders returned to 7 probe / 6 media, and the four rung-ordering tests were
+replaced by an inverted guard asserting that *every* `android`/`ios` rung
+suppresses browser cookies, so the dead rungs cannot be reintroduced.
+
+Process note: this was caught only because the final whole-branch review flagged
+R1's premise as unverifiable in a container without yt-dlp and asked for a check
+against the real tool. Every prior review passed it, because nothing in the diff
+could reveal it.
 
 ## Background
 
@@ -48,13 +91,17 @@ need no code change) plus one new defect found during design (R7).
 
 | ID | Defect | Resolution |
 |----|--------|------------|
-| R1 | `android`/`ios` rungs lost browser cookies, so a gated video that only those clients can serve now fails | Append cookie-bearing `android`/`ios` rungs as last resort |
+| ~~R1~~ | ~~`android`/`ios` rungs lost browser cookies, so a gated video that only those clients can serve now fails~~ | **WITHDRAWN — not a regression; see Correction. Implemented, then reverted in `eb12110`.** |
 | R2 | `_generic_argsets()` dropped `--js-runtimes node`, generic yt-dlp infrastructure, for all non-YouTube sites | Hoist node into `_base_args`, gated on `shutil.which` |
 | R3 | Non-YouTube fallback depth fell 7 → 3 | No code change; document why |
 | R4 | `_impersonation_available()` caches `False` on timeout/exception, disabling impersonation for the whole run | Cache only on a completed subprocess run |
 | R5 | `_media_pass` start line logs `_argset_label`, failure lines log `client_name`; the two no longer correlate | Use `client_name` for both `_media_pass` lines, once names are unique |
 | R6 | `_check_impersonation()` spawns a yt-dlp subprocess on every invocation, including no-URL runs | Make the probe lazy; delete the eager startup call |
 | R7 | `_client_name_for_argset` collides: `[]` and the cookieless generic rung both return `"default"` | Add a `+nocookies` suffix to the name |
+
+> **Superseded.** The paragraph below reasons about a gap that does not exist:
+> `android`/`ios` cannot serve gated videos with or without cookies, because
+> yt-dlp skips those clients outright when cookies are present. See Correction.
 
 R1's severity is narrower than it first appears. Of the seven YouTube probe
 rungs, four (`tv_embedded`, `web`, `mweb`, `tv_html5_embed`) carry cookies both
@@ -91,7 +138,13 @@ Names must stay stable across items in a playlist run, since
 `_PREFERRED_YT_CLIENT` persists. They do — the name is a pure function of the
 argset.
 
-### 2. Cookie-bearing last-resort rungs (R1)
+### 2. Cookie-bearing last-resort rungs (R1) — WITHDRAWN
+
+> **Do not implement this section.** It was built and then reverted in
+> `eb12110`. The rungs it specifies can never succeed: yt-dlp skips the
+> `android`/`ios` clients entirely when browser cookies are present. See
+> Correction. The current code asserts the opposite invariant — every
+> `android`/`ios` rung *must* suppress browser cookies.
 
 Append to the YouTube branch of `_probe_client_argsets(url)`, *after* the
 existing cookieless `android`/`ios` rungs:
@@ -197,9 +250,9 @@ a shared fixture must therefore load per-test, not per-session.
 | Every rung name in the YouTube media ladder is unique | same, on the second ladder |
 | Every rung name in the generic ladder is unique | `[]` and the cookieless rung both returning `default` |
 | `_client_name_for_argset` returns `android+nocookies` for the cookieless rung and `android` for the cookie-bearing one | the `+nocookies` suffix rule dropped or inverted |
-| The last two YouTube probe rungs contain no `--no-cookies-from-browser` | R1 silently reverted |
-| The last two YouTube media rungs contain no `--no-cookies-from-browser` | same, on the second ladder |
-| A cookieless `android` rung appears strictly before the cookie-bearing one | ordering inverted, changing behaviour for videos that work today |
+| ~~The last two YouTube probe rungs contain no `--no-cookies-from-browser`~~ | **WITHDRAWN — the shipped test asserts the exact opposite: every `android`/`ios` rung MUST contain `--no-cookies-from-browser`. See Correction.** |
+| ~~The last two YouTube media rungs contain no `--no-cookies-from-browser`~~ | **WITHDRAWN — same inversion.** |
+| ~~A cookieless `android` rung appears strictly before the cookie-bearing one~~ | **WITHDRAWN — no cookie-bearing rung exists.** |
 | No rung in either ladder contains `--js-runtimes` | section 3 applied to only some rungs |
 | Every YouTube `web`/`mweb` rung still contains `--remote-components ejs:github` | the ejs flag removed along with node |
 | `_generic_argsets()` contains no `youtube:player_client` token | generic routing regressed to the YouTube ladder |

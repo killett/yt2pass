@@ -121,34 +121,24 @@ def test_every_generic_rung_has_a_unique_name(yt2pass, monkeypatch, impersonatio
     assert len(set(names)) == len(names), f"duplicate rung names: {names}"
 
 
-def test_probe_ladder_ends_with_cookie_bearing_android_and_ios(yt2pass, yt_url):
-    ladder = yt2pass._probe_client_argsets(yt_url)
-    names = [yt2pass._client_name_for_argset(a) for a in ladder]
-    assert names[-2:] == ["android", "ios"]
-    for argset in ladder[-2:]:
-        assert "--no-cookies-from-browser" not in argset
-
-
-def test_media_ladder_ends_with_cookie_bearing_android_and_ios(yt2pass, yt_url):
-    ladder = yt2pass._media_blind_client_overrides(yt_url)
-    names = [yt2pass._client_name_for_argset(a) for a in ladder]
-    assert names[-2:] == ["android", "ios"]
-    for argset in ladder[-2:]:
-        assert "--no-cookies-from-browser" not in argset
-
-
-def test_probe_ladder_tries_cookieless_before_cookie_bearing(yt2pass, yt_url):
-    names = [yt2pass._client_name_for_argset(a)
-             for a in yt2pass._probe_client_argsets(yt_url)]
-    assert names.index("android+nocookies") < names.index("android")
-    assert names.index("ios+nocookies") < names.index("ios")
-
-
-def test_media_ladder_tries_cookieless_before_cookie_bearing(yt2pass, yt_url):
-    names = [yt2pass._client_name_for_argset(a)
-             for a in yt2pass._media_blind_client_overrides(yt_url)]
-    assert names.index("android+nocookies") < names.index("android")
-    assert names.index("ios+nocookies") < names.index("ios")
+def test_every_android_and_ios_rung_suppresses_browser_cookies(yt2pass, yt_url):
+    # yt-dlp refuses to run the android/ios clients when cookies are present:
+    #   WARNING: [youtube] Skipping client "android" since it does not support
+    #   cookies
+    # and then finds no formats at all. _base_args always passes
+    # --cookies-from-browser, so a rung that omits --no-cookies-from-browser is
+    # not a last-resort chance at gated videos -- it is a guaranteed dead rung.
+    checked = 0
+    for ladder in (yt2pass._probe_client_argsets(yt_url),
+                   yt2pass._media_blind_client_overrides(yt_url)):
+        for argset in ladder:
+            name = yt2pass._client_name_for_argset(argset)
+            if name.startswith(("android", "ios")):
+                assert "--no-cookies-from-browser" in argset, (
+                    f"{name} rung does not suppress browser cookies; yt-dlp "
+                    "will skip the client entirely and find no formats")
+                checked += 1
+    assert checked == 4, f"expected 4 android/ios rungs, checked {checked}"
 
 
 def test_generic_ladder_has_no_youtube_player_client(yt2pass, monkeypatch):

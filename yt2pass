@@ -1462,18 +1462,19 @@ def _probe_client_argsets(url: str) -> list[list[str]]:
          "--remote-components", "ejs:github"],
         # tv_html5_embed (can be great, sometimes crashes)
         ["--extractor-args", "youtube:player_client=tv_html5_embed"],
-        # lightweight app probes last
+        # Lightweight app probes last. These two MUST suppress browser cookies:
+        # _base_args always passes --cookies-from-browser, and yt-dlp refuses to
+        # run these clients when cookies are present, logging
+        #   WARNING: [youtube] Skipping client "android" since it does not
+        #   support cookies
+        # and then finding no formats at all. A cookie-bearing android/ios rung
+        # is therefore strictly useless, not a last-resort chance at gated
+        # videos -- verified against yt-dlp 2026.07 with curl_cffi-0.13.0.
+        # Do not add one.
         ["--extractor-args", "youtube:player_client=android",
          "--no-cookies-from-browser", "--no-cookies"],
         ["--extractor-args", "youtube:player_client=ios",
          "--no-cookies-from-browser", "--no-cookies"],
-        # Same two clients again, this time WITH the browser cookies that
-        # _base_args always supplies. Cookieless is the better default for
-        # these clients, so it goes first; but a gated video (age-restricted,
-        # members-only, private) may be servable only here, and this ladder is
-        # reached only after everything above has already failed.
-        ["--extractor-args", "youtube:player_client=android"],
-        ["--extractor-args", "youtube:player_client=ios"],
     ]
 
 
@@ -2741,13 +2742,12 @@ def _media_blind_client_overrides(url: str) -> list[list[str]]:
          "--remote-components", "ejs:github"],
         ["--extractor-args", "youtube:player_client=mweb",
          "--remote-components", "ejs:github"],
+        # Cookie suppression on these two is mandatory, not a preference; see
+        # the note in _probe_client_argsets.
         ["--extractor-args", "youtube:player_client=android",
          "--no-cookies-from-browser", "--no-cookies"],
         ["--extractor-args", "youtube:player_client=ios",
          "--no-cookies-from-browser", "--no-cookies"],
-        # Cookie-bearing last resort; see the note in _probe_client_argsets.
-        ["--extractor-args", "youtube:player_client=android"],
-        ["--extractor-args", "youtube:player_client=ios"],
     ]
     preferred = _PREFERRED_YT_CLIENT
     if not preferred:

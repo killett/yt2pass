@@ -1089,6 +1089,55 @@ def _stderr_wants_impersonation(s: str | None) -> bool:
     return s is not None and "no impersonate target is available" in s.lower()
 
 
+# yt-dlp's warning when the yt-dlp-ejs package beside it is a version it does
+# not support. Only the python-package source needs the user: a stale cached
+# copy is cleared and refetched by yt-dlp itself.
+_OUTDATED_EJS_RE = re.compile(
+    r"challenge solver \w+ script version (?P<have>[^\s(]+) is not supported "
+    r"\(source: python package\b[^)]*supported version: (?P<want>[^\s)]+)\)",
+    re.IGNORECASE)
+
+_EJS_FIX_HINT = (
+    "YouTube's JS challenges go unsolved without it, so expect missing formats "
+    "and HTTP 403 on download.\n"
+    "Reinstall so the [default] extra keeps it in step with yt-dlp:\n"
+    '    pipx install --force --pip-args="--pre" "yt-dlp[default,curl-cffi]"\n'
+    "Or, if yt-dlp is not a pipx install, inside its environment:\n"
+    '    python -m pip install -U --pre "yt-dlp[default,curl-cffi]"\n'
+    "Verify with: yt-dlp -v --ignore-config --version  (look for yt_dlp_ejs-<needed version>)"
+)
+
+_WARNED_OUTDATED_EJS: bool = False
+
+
+def _outdated_ejs_versions(s: str | None) -> tuple[str, str] | None:
+    """Find yt-dlp's rejection of the installed yt-dlp-ejs package in stderr.
+
+    Args:
+        s: yt-dlp stderr (may be None).
+
+    Returns:
+        (installed, needed) versions, or None if the warning is absent.
+    """
+    m = _OUTDATED_EJS_RE.search(s or "")
+    return (m.group("have"), m.group("want")) if m else None
+
+
+def _warn_if_outdated_ejs(s: str | None) -> None:
+    """Log the yt-dlp-ejs repair hint the first time yt-dlp's stderr calls for it.
+
+    Args:
+        s: yt-dlp stderr (may be None).
+    """
+    global _WARNED_OUTDATED_EJS
+    versions = _outdated_ejs_versions(s)
+    if _WARNED_OUTDATED_EJS or versions is None:
+        return
+    _WARNED_OUTDATED_EJS = True
+    logging.warning("yt-dlp-ejs %s is installed, but this yt-dlp needs %s. %s",
+                    versions[0], versions[1], _EJS_FIX_HINT)
+
+
 def _ensure_aria_if_requested(options: Options) -> None:
     """
     If --aria was requested, verify that aria2c is installed and runnable.
@@ -1563,6 +1612,9 @@ def _probe_info(options: Options, url: str) -> dict:
                 *_probe_common_flags(),
                 "-J", url
             )
+            # Checked on success too: the probe can still succeed when yt-dlp
+            # could not solve JS challenges, then the downloads fail with 403.
+            _warn_if_outdated_ejs(cp.stderr)
             if cp.returncode == 0 and (cp.stdout or "").strip():
                 try:
                     info = json.loads(cp.stdout)
@@ -2577,6 +2629,7 @@ def _subs_pass(options: Options, url: str, extra_args: Iterable[str], *,
             cp = _ytdlp(*(_base_args(options, fast=False)),
                         *(_subs_args(options, ",".join(attempt_keys))),
                         url, *extra_args)
+            _warn_if_outdated_ejs(cp.stderr)
             if cp.stderr:
                 if logging.getLogger().isEnabledFor(logging.DEBUG): logging.debug("subs(stderr): %s", cp.stderr.strip())
 

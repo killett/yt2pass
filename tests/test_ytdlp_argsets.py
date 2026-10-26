@@ -1,7 +1,9 @@
-"""Tests for yt2pass's yt-dlp argset ladders, URL routing, and forwarded args."""
+"""Tests for yt2pass's yt-dlp argsets, URL routing, stderr hints, and forwarded args."""
 
 import importlib.machinery
 import importlib.util
+import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -350,3 +352,86 @@ def test_lookalike_forwarded_args_pass_through_unchanged(
         yt2pass, monkeypatch, forwarded):
     options = _parsed_options(yt2pass, monkeypatch, _KEYNOTE_URL, *forwarded)
     assert options.args.extra == forwarded
+
+
+# --- Outdated yt-dlp-ejs hint ---------------------------------------------
+#
+# Field report: a recent yt-dlp next to yt-dlp-ejs 0.3.0 rejected the package's
+# challenge-solver scripts, so YouTube's JS challenges went unsolved and the
+# only offered format 403'd. These two lines are verbatim from that run.
+
+_OUTDATED_EJS_STDERR = (
+    "WARNING: [youtube] [jsc:deno] Challenge solver lib script version 0.3.0 is not "
+    "supported (source: python package, variant: ScriptVariant.MINIFIED, "
+    "supported version: 0.8.0)\n"
+    "WARNING: [youtube] [jsc:deno] Challenge solver core script version 0.3.0 is not "
+    "supported (source: python package, variant: ScriptVariant.MINIFIED, "
+    "supported version: 0.8.0)\n"
+)
+
+
+def _ejs_hint_records(caplog):
+    return [r for r in caplog.records
+            if r.levelno == logging.WARNING and "yt-dlp-ejs" in r.getMessage()]
+
+
+def _fake_probe_success(yt2pass, monkeypatch, stderr):
+    stdout = json.dumps(_keynote_info([_PROGRESSIVE_FORMAT]))
+    monkeypatch.setattr(yt2pass, "_ytdlp", lambda *args: subprocess.CompletedProcess(
+        args, 0, stdout=stdout, stderr=stderr))
+
+
+def test_outdated_ejs_versions_reads_installed_and_required(yt2pass):
+    assert yt2pass._outdated_ejs_versions(_OUTDATED_EJS_STDERR) == ("0.3.0", "0.8.0")
+
+
+@pytest.mark.parametrize("stderr", [
+    None,
+    # Stale cached scripts: yt-dlp clears and refetches these itself.
+    "WARNING: [youtube] [jsc:deno] Challenge solver lib script version 0.7.1 is not "
+    "supported (source: cache, variant: ScriptVariant.MINIFIED, supported version: 0.8.0)",
+    "WARNING: [youtube] t2LLh6HUG2Y: There are missing subtitles languages because a "
+    "PO token was not provided.",
+    'WARNING: [youtube] Skipping client "android" since it does not support cookies',
+])
+def test_outdated_ejs_versions_ignores_other_stderr(yt2pass, stderr):
+    assert yt2pass._outdated_ejs_versions(stderr) is None
+
+
+def test_successful_probe_warns_about_outdated_ejs(yt2pass, monkeypatch, caplog):
+    options = _parsed_options(yt2pass, monkeypatch, _KEYNOTE_URL)
+    _fake_probe_success(yt2pass, monkeypatch, _OUTDATED_EJS_STDERR)
+
+    yt2pass._probe_info(options, _KEYNOTE_URL)
+
+    [record] = _ejs_hint_records(caplog)
+    message = record.getMessage()
+    assert "0.3.0" in message
+    assert "0.8.0" in message
+    assert '"yt-dlp[default,curl-cffi]"' in message
+
+
+def test_outdated_ejs_hint_is_logged_once_per_run(yt2pass, monkeypatch, caplog):
+    options = _parsed_options(yt2pass, monkeypatch, _KEYNOTE_URL)
+    _fake_probe_success(yt2pass, monkeypatch, _OUTDATED_EJS_STDERR)
+
+    yt2pass._probe_info(options, _KEYNOTE_URL)   # e.g. playlist item 1
+    yt2pass._probe_info(options, _KEYNOTE_URL)   # e.g. playlist item 2
+
+    assert len(_ejs_hint_records(caplog)) == 1
+
+
+def test_subs_pass_stderr_triggers_outdated_ejs_hint(
+        yt2pass, monkeypatch, tmp_path, caplog):
+    monkeypatch.chdir(tmp_path)
+    options = _parsed_options(yt2pass, monkeypatch, "--langs", "en",
+                              "--max-tries", "1", _KEYNOTE_URL)
+    monkeypatch.setattr(yt2pass, "_ytdlp", lambda *args: subprocess.CompletedProcess(
+        args, 1, stdout="", stderr=_OUTDATED_EJS_STDERR))
+
+    # One failed try with --max-tries 1 makes the required 'en' a hard failure.
+    with pytest.raises(RuntimeError, match="Missing required subtitles"):
+        yt2pass._subs_pass(options, _KEYNOTE_URL, [],
+                           info=_keynote_info([_PROGRESSIVE_FORMAT]))
+
+    assert len(_ejs_hint_records(caplog)) == 1

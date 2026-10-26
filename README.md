@@ -320,6 +320,16 @@ YouTube rate-limits subtitle downloads more aggressively than video downloads. I
 
 If `yt-dlp` can only see the low-quality `mp4-low` format — a transient condition that often resolves after a few hours — `yt2pass` will treat it as an error by default and retry. If you want to proceed anyway (for example, to grab a lower-quality copy now), pass `--go-low`.
 
+### HTTP 403 after "Challenge solver … script version … is not supported"
+
+`yt-dlp` solves YouTube's JS challenges with scripts from the `yt-dlp-ejs` package installed beside it, and accepts only the version it pins. When an older copy is installed, the challenges go unsolved: few formats are offered and the download fails with HTTP 403. This happens when `yt-dlp` was installed without its `[default]` extra, so upgrades move `yt-dlp` but leave `yt-dlp-ejs` behind. `yt2pass` spots the warning and logs the installed and needed versions once per run. Reinstall with the extra so future upgrades keep the two in step:
+
+```bash
+pipx install --force --pip-args="--pre" "yt-dlp[default,curl-cffi]"
+```
+
+`yt-dlp -v --ignore-config --version` should then list `yt_dlp_ejs-<needed version>` under "Optional libraries".
+
 ### Subs come out as .vtt instead of .srt
 
 `ffmpeg` is required for the `.vtt` to `.srt` conversion and for embedding subtitles into MKV. Install it with `sudo apt-get install -y ffmpeg` (Linux) or `brew install ffmpeg` (macOS) and re-run.

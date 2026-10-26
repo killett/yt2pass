@@ -376,7 +376,7 @@ def parse_arguments(options: Options) -> None:
     parser.add_argument("url", nargs="?",
                         help="Video/playlist URL (omit to just check yt-dlp and exit)")
     parser.add_argument("extra", nargs=argparse.REMAINDER, default=[],
-                        help="Extra args to forward to yt-dlp (rarely needed)")
+                        help="Extra args to forward to yt-dlp (rarely needed; -o/--output is refused)")
     options.args = parser.parse_args(remaining)  # use remaining from pre-parse
     langs_raw              = options.args.langs
     options.args.langs     = [s.strip().lower() for s in langs_raw.split(",") if s.strip()]
@@ -390,6 +390,12 @@ def parse_arguments(options: Options) -> None:
         raise ValueError("Cannot use both --onlysubs and --nosubs together.")
     if options.args.prefer_720p and options.args.prefer_smallest:
         raise SystemExit("Cannot use --720p and --smallest together.")
+    # yt2pass finds the subtitles it downloaded by the filename it chose, and
+    # forwarded args are placed after its own -o, so a forwarded one would win.
+    for tok in options.args.extra:
+        if tok == "--output" or tok.startswith(("--output=", "-o")):
+            raise SystemExit(f"yt2pass sets the yt-dlp output filename itself; "
+                             f"remove {tok!r} from the arguments forwarded to yt-dlp.")
 
 
 def main() -> None:
@@ -2293,12 +2299,18 @@ def _process_single(options: Options, url: str, extra: list[str], *,
     # Per-call output override: force yt-dlp to use the already-computed safe base
     # (prevents ENAMETOOLONG during the actual download pass).
     out_override = ["-o", f"{title_base}.%(ext)s"]
+    # Forwarded args go last. yt-dlp options only consume tokens to their right,
+    # so a forwarded flag missing its value (e.g. a bare --cookies) fails loudly
+    # instead of taking our -o as its value and leaving the template to be read
+    # as a URL. parse_arguments() refuses a forwarded -o/--output, which would
+    # otherwise win over ours.
+    pass_args = out_override + extra
 
     logging.info("=== Item start%s ===", f" [{prefix.removesuffix(' - ')}]" if prefix else "")
     did_sub_attempts = False
     if not options.args.nosubs:
         try:
-            did_sub_attempts = _subs_pass(options, url, extra + out_override,
+            did_sub_attempts = _subs_pass(options, url, pass_args,
                                           prefix=prefix, info=info, title_base=title_base)
             if options.args.onlysubs:
                 logging.info("Only subs mode: finished subtitles; skipping media pass.")
@@ -2318,7 +2330,7 @@ def _process_single(options: Options, url: str, extra: list[str], *,
     else:
         logging.info("Skipping subtitles pass as per --nosubs.")
 
-    rc = _media_pass(options, url, extra + out_override, info=info)
+    rc = _media_pass(options, url, pass_args, info=info)
     if rc != 0:
         return rc
 

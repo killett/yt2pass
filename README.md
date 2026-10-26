@@ -260,7 +260,7 @@ These hotkeys are not available on Windows.
 | `--po-token` | `$YT_PO_TOKEN` | YouTube PO token in `CLIENT.CONTEXT+TOKEN` format |
 | `--aria` | false | Use `aria2c` as an external downloader for improved performance |
 | `url` | — | Video or playlist URL (omit to check `yt-dlp` status and exit) |
-| `extra` | — | Additional arguments forwarded verbatim to `yt-dlp` (rarely needed) |
+| `extra` | — | Additional arguments forwarded verbatim to `yt-dlp` (rarely needed). They go after the URL, so a flag missing its value fails in `yt-dlp` with an error instead of capturing yt2pass's own arguments. `-o`/`--output` is refused: yt2pass names the output files itself so it can find the subtitles it downloaded |
 
 `--720p` and `--smallest` cannot be used together.
 

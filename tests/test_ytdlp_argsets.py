@@ -1,7 +1,9 @@
-"""Tests for yt2pass's yt-dlp argset ladders and URL routing helpers."""
+"""Tests for yt2pass's yt-dlp argset ladders, URL routing, and forwarded args."""
 
 import importlib.machinery
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -242,3 +244,109 @@ def test_media_argsets_do_not_route_youtube_url_to_generic_ladder(yt2pass, yt_ur
         isinstance(part, str) and part.startswith("youtube:player_client=")
         for argset in ladder for part in argset
     ), f"expected a youtube:player_client rung, got {ladder!r}"
+
+
+# --- Forwarded yt-dlp args ------------------------------------------------
+#
+# Field report: `yt2pass URL --cookies` (filename missing) made yt-dlp read
+# yt2pass's own `-o` as the cookie file, so the output template landed in the
+# URL list ("[generic] '<title> - ID <id>.%(ext)s' is not a valid URL").
+
+_KEYNOTE_URL = "https://www.youtube.com/watch?v=t2LLh6HUG2Y"
+# Hand-derived from the default '%(title)s - %(uploader)s - ID %(id)s' pattern.
+_KEYNOTE_TEMPLATE = "Keynote - Yahoo Finance - ID t2LLh6HUG2Y.%(ext)s"
+_PROGRESSIVE_FORMAT = {
+    "format_id": "18", "ext": "mp4", "url": "https://example.invalid/18.mp4",
+    "vcodec": "avc1.42001E", "acodec": "mp4a.40.2",
+    "width": 640, "height": 360, "tbr": 500.0, "language": "en",
+}
+
+
+def _parsed_options(yt2pass, monkeypatch, *cli):
+    """Run the real CLI parser on `yt2pass *cli` and return the Options."""
+    monkeypatch.setattr(sys, "argv", ["yt2pass", *cli])
+    options = yt2pass.Options()
+    yt2pass.parse_arguments(options)
+    return options
+
+
+def _keynote_info(formats):
+    return {
+        "id": "t2LLh6HUG2Y", "title": "Keynote", "uploader": "Yahoo Finance",
+        "subtitles": {"en": [{"ext": "vtt", "url": "https://example.invalid/en.vtt"}]},
+        "automatic_captions": {},
+        "formats": formats,
+    }
+
+
+def _record_ytdlp_calls(yt2pass, monkeypatch):
+    """Replace both yt-dlp process wrappers; return the list of argvs seen.
+
+    Capture-mode calls fail (rc=1, nothing written) and streaming calls
+    succeed, so each pass makes one download attempt and then stops.
+    """
+    calls = []
+
+    def fake_capture(*args):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+
+    def fake_streaming(*args):
+        calls.append(list(args))
+        return 0
+
+    monkeypatch.setattr(yt2pass, "_ytdlp", fake_capture)
+    monkeypatch.setattr(yt2pass, "_ytdlp_streaming", fake_streaming)
+    return calls
+
+
+@pytest.mark.parametrize(("mode_flag", "formats"), [
+    pytest.param("--onlysubs", [_PROGRESSIVE_FORMAT], id="subtitles-pass"),
+    pytest.param("--nosubs", [_PROGRESSIVE_FORMAT], id="media-pass"),
+    pytest.param("--nosubs", [], id="blind-media-pass"),
+])
+def test_forwarded_args_cannot_swallow_the_output_template(
+        yt2pass, monkeypatch, tmp_path, mode_flag, formats):
+    monkeypatch.chdir(tmp_path)
+    options = _parsed_options(
+        yt2pass, monkeypatch, mode_flag, "--langs", "en", "--max-tries", "1",
+        _KEYNOTE_URL, "--cookies")
+    calls = _record_ytdlp_calls(yt2pass, monkeypatch)
+
+    yt2pass._process_single(options, _KEYNOTE_URL, options.args.extra,
+                            info=_keynote_info(formats))
+
+    downloads = [argv for argv in calls if _KEYNOTE_URL in argv]
+    assert downloads, f"no yt-dlp download call was made; calls={calls!r}"
+    for argv in downloads:
+        # yt-dlp's parser only ever consumes tokens to the right of an option,
+        # so forwarded args at the very end cannot capture anything of ours.
+        assert argv[-1] == "--cookies", argv
+        last_o = max(i for i, tok in enumerate(argv) if tok == "-o")
+        assert argv[last_o + 1] == _KEYNOTE_TEMPLATE, argv
+
+
+@pytest.mark.parametrize("forwarded", [
+    ["-o", "mine.%(ext)s"],
+    ["-omine.%(ext)s"],
+    ["--output", "mine.%(ext)s"],
+    ["--output=mine.%(ext)s"],
+])
+def test_forwarded_output_template_is_rejected(yt2pass, monkeypatch, forwarded):
+    with pytest.raises(SystemExit) as excinfo:
+        _parsed_options(yt2pass, monkeypatch, _KEYNOTE_URL, *forwarded)
+    # A str code is our own refusal; argparse usage errors exit with int 2.
+    message = excinfo.value.code
+    assert isinstance(message, str), message
+    assert forwarded[0] in message
+
+
+@pytest.mark.parametrize("forwarded", [
+    ["--output-na-placeholder", "NA"],   # shares the --output prefix
+    ["--no-overwrites"],                 # contains "-o" as a substring
+    ["--cookies", "cookies.txt"],
+])
+def test_lookalike_forwarded_args_pass_through_unchanged(
+        yt2pass, monkeypatch, forwarded):
+    options = _parsed_options(yt2pass, monkeypatch, _KEYNOTE_URL, *forwarded)
+    assert options.args.extra == forwarded
